@@ -1,0 +1,1516 @@
+# nsga_engine.py
+# -*- coding: utf-8 -*-
+"""
+NSGA-II Dashboard engine
+========================
+
+This file is a full nsga_engine.py integration build that preserves the public
+interface used by app.py while applying the requested upgrade scope only:
+
+CHANGE 1. NSGAConfig extension for the latest 260527 Ground model settings.
+CHANGE 2. _prepare_engine_dataframe() extension to recognize and preserve:
+          QPA, Repairable_Flag, Replace_Time_H, Repair_TAT_H.
+CHANGE 3. _build_engine_context() calculation upgrade:
+          Failure_Rate -> annual lambda, QPA, Fleet Size, p_need, repairable time split.
+CHANGE 4. Candidate selection upgrade:
+          p_need_period, long lead, Ao impact, and long-core protection logic.
+CHANGE 5. Residual shortage exposure helpers/objective upgrade:
+          Poisson EBO based residual risk is added to F2 while preserving UI keys.
+CHANGE 6. Additive result-table upgrade:
+          final_spares_df, repairable_audit_df, diagnostic_df are returned without
+          removing existing app.py result keys.
+CHANGE 7. PERIOD Ao/DT consistency fix:
+          config.years is the single analysis-period control; annual DT is expanded
+          to the full analysis period before Ao = T_obs / (T_obs + DT_period).
+          Canonical period names replace hard-coded 2y internals while legacy output
+          aliases are retained only where needed for app.py backward compatibility.
+
+The public interface and runtime output keys used by the current Streamlit app.py
+are preserved:
+summary, prepared_df, candidate_df, history_df, pareto_df, policy_df,
+sweep_summary_df, all_target_runs_df.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+DEFAULT_RANDOM_SEED = 42
+DEFAULT_TARGET_GRID = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.92, 0.94]
+DEFAULT_REPRESENTATIVE_TARGET = 0.94
+
+# Analysis period master setting.
+# Change this one value (or NSGAConfig.years) to run 3-year, 5-year, etc.
+YEARS = 5.0
+HOURS_PER_YEAR = 365.0 * 24.0
+T_OBS_HOURS = YEARS * HOURS_PER_YEAR
+
+AO_COST_PENALTY = 8.0e8
+ITEM_COUNT_WEIGHT = 1.0
+STOCK_UNIT_WEIGHT = 0.05
+H_PRE = 0.05
+
+ABS_CAP_SMALL = 3
+ABS_CAP_MED = 4
+ABS_CAP_LARGE = 6
+
+BASELINE_WAIT_FRACTION_BY_ECHELON = {
+    "O": 0.75,
+    "I": 0.90,
+    "D": 1.00,
+}
+MIN_WAIT_FLOOR_H_BY_ECHELON = {
+    "O": 1.0,
+    "I": 6.0,
+    "D": 24.0,
+}
+
+PM_EFFECT_ON_FAILURE = 0.03
+PM_EFFECT_ON_RESTORE = 0.18
+
+
+@dataclass
+class NSGAConfig:
+    # Existing app.py fields: do not rename/remove.
+    population_size: int = 60
+    n_generations: int = 40
+    random_seed: int = DEFAULT_RANDOM_SEED
+    target_ao: float = DEFAULT_REPRESENTATIVE_TARGET
+
+    # Existing UI knobs.
+    pmin: float = 0.05
+    long_lead_percentile: float = 0.80
+    ao_impact_percentile: float = 0.75
+
+    # Existing sweep / standardization.
+    ao_target_grid: List[float] = field(default_factory=lambda: list(DEFAULT_TARGET_GRID))
+    representative_target: float = DEFAULT_REPRESENTATIVE_TARGET
+    long_core_impact_percentile: float = 0.70
+    item_count_weight: float = ITEM_COUNT_WEIGHT
+    stock_unit_weight: float = STOCK_UNIT_WEIGHT
+    ao_cost_penalty: float = AO_COST_PENALTY
+    # Analysis period; app.py may override this through the Analysis Years slider.
+    years: float = YEARS
+
+    # CHANGE 1: latest 260527 Ground model setting fields.
+    # These are intentionally added with conservative defaults and are not yet
+    # wired into the objective function in this step.
+    hours_per_year: float = HOURS_PER_YEAR
+    failure_rate_unit: str = "per_million_hours"
+    annual_operating_hours: float = 8760.0
+    apply_qpa_to_failure_rate: bool = True
+    default_qpa: float = 1.0
+    fleet_size: float = 1.0
+    shortage_prob_mode: str = "lead_time_demand"
+    lead_time_shortage_floor_h: float = 1.0
+    use_lead_time_for_stock_cap: bool = True
+    apply_repairable_time_split: bool = True
+    apply_repairable_stock_cap: bool = True
+    stock_cap_safety_z: float = 4.0
+    stock_cap_buffer_units: float = 2.0
+    use_residual_shortage_exposure_f2: bool = True
+    residual_shortage_exposure_weight: float = 0.10
+    residual_shortage_exposure_scale_eps: float = 1e-12
+
+
+def find_best_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    lower_map = {str(c).lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        key = str(cand).lower().strip()
+        if key in lower_map:
+            return lower_map[key]
+    return None
+
+
+def coerce_numeric(series, fill_value: float = 0.0) -> pd.Series:
+    if isinstance(series, pd.Series):
+        idx = series.index
+        s = series
+    else:
+        try:
+            idx = series.index  # type: ignore[attr-defined]
+        except Exception:
+            idx = None
+        s = pd.Series(series)
+        if idx is not None:
+            s.index = idx
+    out = pd.to_numeric(s, errors="coerce")
+    out = out.replace([np.inf, -np.inf], np.nan).fillna(fill_value)
+    return out.astype(float)
+
+
+def _coerce_repairable_flag(series: pd.Series) -> pd.Series:
+    """
+    Convert repairable flag-like values to 0/1 safely.
+
+    Truthy examples: 1, true, y, yes, repairable, 수리가능.
+    Falsy examples: 0, false, n, no, consumable, expendable, 폐기.
+    Unknown or missing values default to 0 so older input files remain compatible.
+    """
+    s = series.copy()
+    numeric = pd.to_numeric(s, errors="coerce")
+    text = s.astype(str).str.strip().str.lower()
+
+    truthy = text.isin([
+        "1", "1.0", "true", "t", "y", "yes", "repairable", "reparable",
+        "r", "수리가능", "수리", "가능", "가능품", "repair", "returnable",
+    ])
+    falsy = text.isin([
+        "0", "0.0", "false", "f", "n", "no", "non-repairable", "nonrepairable",
+        "consumable", "expendable", "폐기", "불가", "소모품", "discard", "condemn",
+    ])
+
+    out = pd.Series(0, index=series.index, dtype=int)
+    out.loc[numeric.fillna(0) > 0] = 1
+    out.loc[truthy] = 1
+    out.loc[falsy] = 0
+    return out.astype(int)
+
+
+def minmax(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=float)
+    if arr.size == 0:
+        return arr.copy()
+    lo = np.nanmin(arr)
+    hi = np.nanmax(arr)
+    if not np.isfinite(lo) or not np.isfinite(hi) or abs(hi - lo) < 1e-12:
+        return np.zeros_like(arr, dtype=float)
+    return (arr - lo) / (hi - lo)
+
+
+def parse_level_to_int(v) -> int:
+    if pd.isna(v):
+        return 0
+    s = str(v)
+    m = re.search(r"(\d+)", s)
+    return int(m.group(1)) if m else 0
+
+
+def map_echelon(v) -> str:
+    if pd.isna(v):
+        return "X"
+    s = str(v).strip().lower()
+    if any(k in s for k in ["organizational", "operational", "operator", "field", "unit", "line", "o-level", "o level", "현장", "운용", "부대", "일선"]):
+        return "O"
+    if any(k in s for k in ["intermediate", "support", "shop", "base", "i-level", "i level", "direct support", "중간", "야전정비", "지원", "정비대"]):
+        return "I"
+    if any(k in s for k in ["depot", "factory", "overhaul", "sustainment", "d-level", "d level", "창정비", "공창", "후방"]):
+        return "D"
+    if s in ["o", "org", "op"]:
+        return "O"
+    if s in ["i", "int"]:
+        return "I"
+    if s in ["d", "dep"]:
+        return "D"
+    return "X"
+
+
+def long_dynamic_cap_from_lambda(lam_period: float) -> int:
+    if lam_period <= 0.30:
+        return ABS_CAP_SMALL
+    if lam_period <= 0.80:
+        return ABS_CAP_MED
+    return ABS_CAP_LARGE
+
+
+def poisson_tail_prob(mu: float, s: int) -> float:
+    mu = max(float(mu), 0.0)
+    s = max(int(s), 0)
+    if mu <= 1e-12:
+        return 0.0
+    term = math.exp(-mu)
+    cdf = term
+    for k in range(1, s + 1):
+        term *= mu / k
+        cdf += term
+    tail = 1.0 - cdf
+    return float(min(max(tail, 0.0), 1.0))
+
+
+def poisson_sf_ge(mu: float, k: int) -> float:
+    """Return P[Poisson(mu) >= k] with small-mu and integer guards."""
+    mu = max(float(mu), 0.0)
+    k = int(k)
+    if k <= 0:
+        return 1.0
+    # poisson_tail_prob(mu, s) returns P[D > s] = P[D >= s+1].
+    return poisson_tail_prob(mu, k - 1)
+
+
+def poisson_ebo_scalar(mu: float, stock: int) -> float:
+    """Expected backorders E[(D-stock)+] for D ~ Poisson(mu)."""
+    mu = max(float(mu), 0.0)
+    s = max(int(stock), 0)
+    if mu <= 1e-12:
+        return 0.0
+    # E[(D-s)+] = mu * P[D >= s] - s * P[D >= s+1]
+    ebo = mu * poisson_sf_ge(mu, s) - s * poisson_sf_ge(mu, s + 1)
+    return float(max(ebo, 0.0))
+
+
+def poisson_ebo_array(mu_vec: np.ndarray, stock_vec: np.ndarray) -> np.ndarray:
+    """Vectorized expected backorder calculation using the stable scalar routine."""
+    mu_arr = np.asarray(mu_vec, dtype=float)
+    stock_arr = np.asarray(stock_vec, dtype=int)
+    if mu_arr.shape != stock_arr.shape:
+        mu_arr, stock_arr = np.broadcast_arrays(mu_arr, stock_arr)
+    out = np.zeros(mu_arr.shape, dtype=float)
+    it = np.nditer([mu_arr, stock_arr, out], flags=['multi_index'], op_flags=[['readonly'], ['readonly'], ['writeonly']])
+    for mu, st, dest in it:
+        dest[...] = poisson_ebo_scalar(float(mu), int(st))
+    return out
+
+
+def node_diag_contrib(level_value: int) -> float:
+    if level_value <= 1:
+        return 0.10
+    if level_value == 2:
+        return 0.18
+    if level_value == 3:
+        return 0.35
+    if level_value == 4:
+        return 0.55
+    if level_value == 5:
+        return 0.80
+    return 1.00
+
+
+def solution_signature(y: np.ndarray, sO: np.ndarray, sI: np.ndarray, sD: np.ndarray) -> str:
+    y = np.asarray(y, dtype=int)
+    sO = np.asarray(sO, dtype=int)
+    sI = np.asarray(sI, dtype=int)
+    sD = np.asarray(sD, dtype=int)
+    return (
+        "Y:" + ",".join(map(str, y.tolist()))
+        + "|O:" + ",".join(map(str, sO.tolist()))
+        + "|I:" + ",".join(map(str, sI.tolist()))
+        + "|D:" + ",".join(map(str, sD.tolist()))
+    )
+
+
+def _prepare_engine_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+
+    col_part = find_best_column(df, ["Part_ID", "part_id", "part", "item", "item_id", "niin", "nsn", "품번", "부품명"])
+    col_parent = find_best_column(df, ["Parent_ID", "parent_id", "parent", "상위품번", "상위부품"])
+    col_level = find_best_column(df, ["Level", "level", "레벨"])
+    col_echelon = find_best_column(df, ["Maint_Echelon", "maint_echelon", "echelon", "정비단계", "정비계층"])
+    col_fr = find_best_column(df, ["Failure_Rate", "failure_rate", "fail_rate", "lambda", "annual_failure_rate", "고장률"])
+    col_price = find_best_column(df, ["Unit_Price_KRW", "unit_cost", "unit_price", "cost", "price", "단가"])
+    col_transport_cost = find_best_column(df, ["Transport_Cost_KRW", "transport_cost"])
+    col_lead = find_best_column(df, ["Total_Lead_Time_H", "lead_time", "leadtime", "lt_days", "lt", "리드타임"])
+    col_transport_time = find_best_column(df, ["Transport_Time_H", "transport_time"])
+    col_cm_cost = find_best_column(df, ["CM_Cost_KRW", "cm_cost", "corrective_cost"])
+    col_cm_time = find_best_column(df, ["CM_Time_Hours", "cm_time", "repair_time", "maintenance_time"])
+    col_condemn = find_best_column(df, ["Condemnation_Rate_Pct", "condemnation_rate_pct", "condemn", "폐기율"])
+    col_pm = find_best_column(df, ["PM_Cycle", "pm_cycle", "pm", "maintenance_cycle", "예방정비주기"])
+    col_rad_idx = find_best_column(df, ["Rad_Degradation_Index", "rad_degradation_index", "soh_score", "SOH_SCORE"])
+    col_ann_rad = find_best_column(df, ["Annual_Rad_Hours", "annual_rad_hours"])
+    col_env_res = find_best_column(df, ["Env_Resistance", "env_resistance", "환경저항성", "env_res"])
+
+    # CHANGE 2: latest 260527 Ground optional columns.
+    col_qpa = find_best_column(df, [
+        "QPA", "Quantity_Per_Equipment", "Qty_Per_Equipment", "Quantity_Per_System",
+        "Qty_Per_System", "Qty_Per_Assembly", "qpa", "qty_per_equipment",
+        "qty_per_system", "대당수량", "장착수량",
+    ])
+    col_repairable = find_best_column(df, [
+        "Repairable_Flag", "Is_Repairable", "Repairable", "Repair_Return_Flag",
+        "repairable_flag", "is_repairable", "repairable", "수리가능여부", "수리가능",
+    ])
+    col_replace_time = find_best_column(df, [
+        "Replace_Time_H", "Replacement_Time_H", "Swap_Time_H", "Remove_Install_Time_H",
+        "replace_time_h", "replacement_time_h", "swap_time_h", "교체시간", "장탈착시간",
+    ])
+    col_repair_tat = find_best_column(df, [
+        "Repair_TAT_H", "Repair_Turnaround_Time_H", "Repair_Turn_Around_Time_H",
+        "Repair_Time_H", "Depot_Repair_Time_H", "repair_tat_h",
+        "repair_turnaround_time_h", "repair_time_h", "수리TAT", "수리기간", "창정비시간",
+    ])
+
+    if col_part is None:
+        df["part_id"] = [f"PART_{i + 1:05d}" for i in range(len(df))]
+        col_part = "part_id"
+
+    out = pd.DataFrame(index=df.index)
+    out["part_id"] = df[col_part].astype(str)
+    out["parent_id"] = df[col_parent].astype(str) if col_parent is not None else ""
+    out["level_raw"] = df[col_level] if col_level is not None else 0
+    out["level_num"] = out["level_raw"].apply(parse_level_to_int)
+    out["maint_echelon_raw"] = df[col_echelon] if col_echelon is not None else "O"
+    out["maint_echelon"] = out["maint_echelon_raw"].apply(map_echelon)
+
+    out["failure_rate"] = coerce_numeric(df[col_fr], 0.01) if col_fr is not None else 0.01
+    out["unit_cost"] = coerce_numeric(df[col_price], 1000.0) if col_price is not None else 1000.0
+    out["transport_cost"] = coerce_numeric(df[col_transport_cost], 0.0) if col_transport_cost is not None else 0.0
+    out["lead_time"] = coerce_numeric(df[col_lead], 24.0) if col_lead is not None else 24.0
+    out["transport_time"] = coerce_numeric(df[col_transport_time], 8.0) if col_transport_time is not None else np.maximum(1.0, out["lead_time"] * 0.20)
+    out["cm_cost"] = coerce_numeric(df[col_cm_cost], 0.3 * out["unit_cost"].mean() if len(out) else 1000.0) if col_cm_cost is not None else np.maximum(200.0, out["unit_cost"] * 0.25)
+    out["cm_time"] = coerce_numeric(df[col_cm_time], np.maximum(1.0, out["lead_time"] * 0.10)) if col_cm_time is not None else np.maximum(1.0, out["lead_time"] * 0.10)
+    out["condemn_pct"] = coerce_numeric(df[col_condemn], 10.0) if col_condemn is not None else 10.0
+    out["pm_cycle"] = coerce_numeric(df[col_pm], 365.0) if col_pm is not None else 365.0
+    out["rad_deg_index"] = coerce_numeric(df[col_rad_idx], 0.0) if col_rad_idx is not None else 0.0
+    out["annual_rad_hours"] = coerce_numeric(df[col_ann_rad], 0.0) if col_ann_rad is not None else 0.0
+    out["env_resistance"] = coerce_numeric(df[col_env_res], 3.0) if col_env_res is not None else 3.0
+
+    # CHANGE 2: preserve optional latest Ground columns without changing logic yet.
+    out["qpa"] = coerce_numeric(df[col_qpa], 1.0) if col_qpa is not None else 1.0
+    out["repairable_flag"] = _coerce_repairable_flag(df[col_repairable]) if col_repairable is not None else 0
+    out["replace_time_h"] = coerce_numeric(df[col_replace_time], 0.0) if col_replace_time is not None else 0.0
+    out["repair_tat_h"] = coerce_numeric(df[col_repair_tat], 0.0) if col_repair_tat is not None else 0.0
+
+    out["failure_rate"] = out["failure_rate"].clip(lower=0.0)
+    out["unit_cost"] = out["unit_cost"].clip(lower=0.0)
+    out["lead_time"] = out["lead_time"].clip(lower=1.0)
+    out["transport_time"] = out["transport_time"].clip(lower=0.1)
+    out["cm_cost"] = out["cm_cost"].clip(lower=0.0)
+    out["cm_time"] = out["cm_time"].clip(lower=0.1)
+    out["condemn_pct"] = out["condemn_pct"].clip(lower=0.0, upper=100.0)
+    out["pm_cycle"] = out["pm_cycle"].replace(0, 365).clip(lower=1.0)
+    out["env_resistance"] = out["env_resistance"].clip(lower=1.0, upper=5.0)
+    out["qpa"] = out["qpa"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=0.0)
+    out["repairable_flag"] = out["repairable_flag"].replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1).astype(int)
+    out["replace_time_h"] = out["replace_time_h"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    out["repair_tat_h"] = out["repair_tat_h"].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+
+    # display/compatibility columns for existing app preview
+    fr_norm = minmax(out["failure_rate"].to_numpy())
+    out["criticality"] = np.where(fr_norm >= 0.80, 1.00, np.where(fr_norm >= 0.50, 0.45, 0.15))
+    out["stock"] = 0
+    out["holding_cost"] = H_PRE * out["unit_cost"]
+    out["base_score"] = (
+        out["failure_rate"] * 0.45
+        + (out["lead_time"] / max(float(out["lead_time"].max()), 1.0)) * 0.20
+        + (out["criticality"] / max(float(out["criticality"].max()), 1.0)) * 0.35
+    )
+    return out.reset_index(drop=True)
+
+
+
+def convert_failure_rate_to_annual_lambda(
+    failure_rate: np.ndarray,
+    failure_rate_unit: str = "per_million_hours",
+    annual_operating_hours: float = 8760.0,
+) -> np.ndarray:
+    """
+    Convert Failure_Rate into annual item-level failure intensity.
+
+    Supported units:
+    - per_million_hours: OPUS10-style failures per 1,000,000 hours
+    - per_hour: direct hourly rate
+    - per_year / annual: already annualized
+
+    Unknown unit is treated conservatively as annualized to preserve compatibility.
+    """
+    fr = np.asarray(failure_rate, dtype=float)
+    fr = np.nan_to_num(fr, nan=0.0, posinf=0.0, neginf=0.0)
+    fr = np.clip(fr, 0.0, None)
+    unit = str(failure_rate_unit or "per_million_hours").strip().lower()
+    hours = max(float(annual_operating_hours or 8760.0), 1.0)
+    if unit in ["per_million_hours", "per_million_hour", "pmh", "failures_per_million_hours", "per_1e6_hours"]:
+        return fr * hours / 1_000_000.0
+    if unit in ["per_hour", "hourly", "lambda_h", "lambda_per_hour"]:
+        return fr * hours
+    if unit in ["per_year", "annual", "yearly", "lambda_y", "lambda_per_year"]:
+        return fr
+    return fr
+
+
+def percentile_rank_array(values: np.ndarray) -> np.ndarray:
+    """Return 0~1 percentile-like ranks, stable for ties and empty arrays."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr.copy()
+    arr2 = np.nan_to_num(arr, nan=np.nanmedian(arr[np.isfinite(arr)]) if np.any(np.isfinite(arr)) else 0.0)
+    order = np.argsort(arr2, kind="mergesort")
+    ranks = np.empty_like(arr2, dtype=float)
+    if arr2.size == 1:
+        ranks[order] = 1.0
+    else:
+        ranks[order] = np.linspace(0.0, 1.0, arr2.size)
+    return ranks
+
+
+def apply_repairable_time_split(
+    restore_base_h: np.ndarray,
+    lead_h: np.ndarray,
+    repairable_flag: np.ndarray,
+    replace_time_h: np.ndarray,
+    repair_tat_h: np.ndarray,
+    config: NSGAConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Split repairable item time logic.
+
+    - Ao restore time uses Replace_Time_H when the item is repairable and replace time exists.
+    - Shortage exposure / repair pipeline uses Repair_TAT_H when the item is repairable and TAT exists.
+    - Otherwise existing restore/lead-time logic is preserved.
+    """
+    restore_base = np.asarray(restore_base_h, dtype=float)
+    lead = np.asarray(lead_h, dtype=float)
+    repairable = np.asarray(repairable_flag, dtype=int) > 0
+    replace_t = np.asarray(replace_time_h, dtype=float)
+    tat = np.asarray(repair_tat_h, dtype=float)
+
+    restore_used = np.nan_to_num(restore_base, nan=0.0, posinf=0.0, neginf=0.0).copy()
+    exposure = np.maximum(np.nan_to_num(lead, nan=0.0, posinf=0.0, neginf=0.0), float(getattr(config, "lead_time_shortage_floor_h", 1.0)))
+
+    restore_split = np.zeros_like(restore_used, dtype=bool)
+    exposure_split = np.zeros_like(exposure, dtype=bool)
+
+    if bool(getattr(config, "apply_repairable_time_split", True)):
+        use_replace = repairable & np.isfinite(replace_t) & (replace_t > 0)
+        restore_used[use_replace] = replace_t[use_replace]
+        restore_split[use_replace] = True
+
+        use_tat = repairable & np.isfinite(tat) & (tat > 0)
+        exposure[use_tat] = tat[use_tat]
+        exposure_split[use_tat] = True
+
+    restore_used = np.maximum(np.nan_to_num(restore_used, nan=0.0, posinf=0.0, neginf=0.0), 0.1)
+    exposure = np.maximum(np.nan_to_num(exposure, nan=0.0, posinf=0.0, neginf=0.0), float(getattr(config, "lead_time_shortage_floor_h", 1.0)))
+    return restore_used, exposure, restore_split, exposure_split
+
+
+def stock_cap_from_pipeline_mu(
+    mu_pipe: np.ndarray,
+    lambda_period: np.ndarray,
+    is_long: np.ndarray,
+    repairable_flag: np.ndarray,
+    config: NSGAConfig,
+) -> np.ndarray:
+    """Repairable-aware stock cap based on pipeline demand and period demand."""
+    mu = np.asarray(mu_pipe, dtype=float)
+    lam = np.asarray(lambda_period, dtype=float)
+    long_mask = np.asarray(is_long, dtype=bool)
+    repairable = np.asarray(repairable_flag, dtype=int) > 0
+    z = float(getattr(config, "stock_cap_safety_z", 4.0))
+    buf = float(getattr(config, "stock_cap_buffer_units", 2.0))
+    cap = np.ceil(mu + z * np.sqrt(np.maximum(mu, 1e-9)) + buf).astype(int)
+    small = int(getattr(config, "abs_cap_small", ABS_CAP_SMALL) if hasattr(config, "abs_cap_small") else ABS_CAP_SMALL)
+    med = int(getattr(config, "abs_cap_med", ABS_CAP_MED) if hasattr(config, "abs_cap_med") else ABS_CAP_MED)
+    large = int(getattr(config, "abs_cap_large", ABS_CAP_LARGE) if hasattr(config, "abs_cap_large") else ABS_CAP_LARGE)
+    abs_cap = np.where(lam <= 0.30, small, np.where(lam <= 0.80, med, large))
+    cap = np.where(long_mask, np.maximum(cap, abs_cap), cap)
+    if bool(getattr(config, "apply_repairable_stock_cap", True)):
+        cap = np.where(repairable, np.maximum(cap, np.ceil(mu + 1.0).astype(int)), cap)
+    cap = np.nan_to_num(cap, nan=1, posinf=999, neginf=1).astype(int)
+    return np.clip(cap, 1, 999)
+
+def _build_engine_context(df_prepared: pd.DataFrame, config: NSGAConfig) -> Dict[str, object]:
+    """
+    CHANGE 3/4 upgraded calculation context.
+
+    Preserves all keys consumed by the existing app.py-facing optimization code,
+    while upgrading the internal demand logic to the latest Ground model direction:
+    Failure_Rate -> annual lambda, QPA, Fleet Size, period demand, p_need, and
+    repairable time split. Candidate selection is also upgraded with p_need,
+    long lead, Ao impact, and long-core protection conditions.
+    """
+    df = df_prepared.copy()
+    n_all = len(df)
+    if n_all == 0:
+        raise ValueError("Input dataframe is empty.")
+
+    part_id_all = df["part_id"].astype(str).to_numpy()
+    parent_id_all = df["parent_id"].astype(str).replace("nan", "").replace("None", "").to_numpy()
+    level_num_all = df["level_num"].to_numpy(dtype=int)
+    echelon_cat_all = df["maint_echelon"].to_numpy(dtype=object)
+
+    FR_raw_all = np.nan_to_num(df["failure_rate"].to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    unit_price_all = df["unit_cost"].to_numpy(dtype=float)
+    transport_cost_all = df["transport_cost"].to_numpy(dtype=float)
+    lead_all = df["lead_time"].to_numpy(dtype=float)
+    transport_time_all = df["transport_time"].to_numpy(dtype=float)
+    cm_cost_all = df["cm_cost"].to_numpy(dtype=float)
+    cm_time_all = df["cm_time"].to_numpy(dtype=float)
+    condemn_all = np.clip(df["condemn_pct"].to_numpy(dtype=float) / 100.0, 0.0, 1.0)
+    pm_cycle_all = df["pm_cycle"].to_numpy(dtype=float)
+
+    qpa_all = np.nan_to_num(df.get("qpa", pd.Series(float(getattr(config, "default_qpa", 1.0)), index=df.index)).to_numpy(dtype=float), nan=float(getattr(config, "default_qpa", 1.0)), posinf=float(getattr(config, "default_qpa", 1.0)), neginf=float(getattr(config, "default_qpa", 1.0)))
+    qpa_all = np.clip(qpa_all, 0.0, None)
+    repairable_all = np.nan_to_num(df.get("repairable_flag", pd.Series(0, index=df.index)).to_numpy(dtype=int), nan=0).astype(int)
+    repairable_all = np.clip(repairable_all, 0, 1)
+    replace_time_all = np.nan_to_num(df.get("replace_time_h", pd.Series(0.0, index=df.index)).to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    repair_tat_all = np.nan_to_num(df.get("repair_tat_h", pd.Series(0.0, index=df.index)).to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Latest Ground demand logic.
+    lambda_item_all = convert_failure_rate_to_annual_lambda(
+        FR_raw_all,
+        getattr(config, "failure_rate_unit", "per_million_hours"),
+        getattr(config, "annual_operating_hours", 8760.0),
+    )
+    if bool(getattr(config, "apply_qpa_to_failure_rate", True)):
+        lambda_system_all = lambda_item_all * qpa_all
+    else:
+        lambda_system_all = lambda_item_all.copy()
+    lambda_demand_all = lambda_system_all * max(float(getattr(config, "fleet_size", 1.0)), 0.0)
+    # PERIOD FIX: config.years is the single source of truth for analysis duration.
+    # YEAR-SLIDER INTEGRATION: config.years is supplied by app.py.
+    # Validate instead of silently clamping so an invalid UI/API value cannot
+    # produce a misleading analysis period.
+    period_years = float(getattr(config, "years", YEARS))
+    if (not np.isfinite(period_years)) or period_years <= 0.0:
+        raise ValueError("NSGAConfig.years must be a positive finite number.")
+    hours_per_year = max(float(getattr(config, "hours_per_year", HOURS_PER_YEAR)), 1e-9)
+    t_obs_hours = period_years * hours_per_year
+    lambda_period_all = lambda_demand_all * period_years
+
+    # PM compatibility: keep existing config behavior, but apply it after annual conversion.
+    pm_norm_all = 1.0 / np.sqrt(np.maximum(pm_cycle_all, 1.0) / 365.0)
+    pm_norm_all = np.clip(pm_norm_all, 0.0, 1.0)
+    gamma_all = PM_EFFECT_ON_FAILURE * pm_norm_all
+    delta_all = PM_EFFECT_ON_RESTORE * pm_norm_all
+    lambda_system_pm_all = lambda_system_all * (1.0 - gamma_all)
+    lambda_demand_pm_all = lambda_demand_all * (1.0 - gamma_all)
+    lambda_period_pm_all = lambda_demand_pm_all * period_years
+
+    proc_cost_all = unit_price_all + transport_cost_all
+
+    part_to_idx = {pid: i for i, pid in enumerate(part_id_all)}
+    children_map = {i: [] for i in range(n_all)}
+    for i in range(n_all):
+        p = parent_id_all[i]
+        if p and p in part_to_idx:
+            children_map[part_to_idx[p]].append(i)
+    is_leaf_all = np.array([len(children_map[i]) == 0 for i in range(n_all)], dtype=bool)
+
+    def get_ancestor_chain(idx: int) -> List[int]:
+        chain_rev = [idx]
+        seen = {idx}
+        cur_parent = parent_id_all[idx]
+        hop = 0
+        while cur_parent not in ["", "nan", "None", "null"]:
+            cur_parent = str(cur_parent)
+            if cur_parent not in part_to_idx:
+                break
+            pidx = part_to_idx[cur_parent]
+            if pidx in seen:
+                break
+            chain_rev.append(pidx)
+            seen.add(pidx)
+            cur_parent = parent_id_all[pidx]
+            hop += 1
+            if hop > 50:
+                break
+        return list(reversed(chain_rev))
+
+    all_ancestor_chains = [get_ancestor_chain(i) for i in range(n_all)]
+    depth_all = np.array([len(ch) for ch in all_ancestor_chains], dtype=int)
+
+    has_physical_attr = ((unit_price_all > 0) | (cm_time_all > 0) | (lead_all > 0))
+    # Keep the previous Level/leaf structure, but use converted annual lambda for failure existence.
+    spare_demand_mask = ((level_num_all >= 3) & is_leaf_all & (lambda_system_all > 0) & has_physical_attr)
+    if int(spare_demand_mask.sum()) < 20:
+        spare_demand_mask = ((level_num_all >= 3) & (lambda_system_all > 0) & has_physical_attr)
+    spare_idx = np.where(spare_demand_mask)[0]
+    if len(spare_idx) == 0:
+        raise ValueError("No real spare-demand parts found from uploaded data.")
+
+    # Arrays for spare-demand population.
+    fr_raw_sp = FR_raw_all[spare_idx]
+    lambda_item_sp = lambda_item_all[spare_idx]
+    lambda_system_sp = lambda_system_pm_all[spare_idx]
+    lambda_demand_sp = lambda_demand_pm_all[spare_idx]
+    lambda_period_sp = lambda_period_pm_all[spare_idx]
+    proc_cost_sp = proc_cost_all[spare_idx]
+    lead_sp = lead_all[spare_idx]
+    transport_sp = transport_time_all[spare_idx]
+    cm_cost_sp = cm_cost_all[spare_idx]
+    cm_time_sp = cm_time_all[spare_idx]
+    condemn_sp = condemn_all[spare_idx]
+    delta_sp = delta_all[spare_idx]
+    level_sp = level_num_all[spare_idx]
+    depth_sp = depth_all[spare_idx]
+    echelon_sp = echelon_cat_all[spare_idx]
+    part_id_sp = part_id_all[spare_idx]
+    parent_id_sp = parent_id_all[spare_idx]
+    qpa_sp = qpa_all[spare_idx]
+    repairable_sp = repairable_all[spare_idx]
+    replace_time_sp = replace_time_all[spare_idx]
+    repair_tat_sp = repair_tat_all[spare_idx]
+    chains_sp = [all_ancestor_chains[i] for i in spare_idx]
+
+    parent_group_map: Dict[str, List[int]] = {}
+    for local_idx, global_idx in enumerate(spare_idx):
+        p = parent_id_all[global_idx]
+        p = str(p) if p not in ["", "nan", "None", "null"] else f"ROOT_{part_id_all[global_idx]}"
+        parent_group_map.setdefault(p, []).append(local_idx)
+
+    # Existing sibling normalization preserved, now based on annual system lambda.
+    lambda_eff_sp = lambda_system_sp.copy()
+    for _, members in parent_group_map.items():
+        if len(members) <= 1:
+            continue
+        fr_sub = lambda_system_sp[members]
+        total = fr_sub.sum()
+        if total > 1e-12:
+            shares = fr_sub / total
+            lambda_eff_sp[members] = total * shares / len(members) * 1.2
+
+    T_diag_sp = np.zeros(len(spare_idx), dtype=float)
+    for k, chain in enumerate(chains_sp):
+        T_diag_sp[k] = sum(node_diag_contrib(int(level_num_all[node_idx])) for node_idx in chain)
+
+    T_reminst_sp = 0.35 * np.maximum(cm_time_sp, 1.0)
+    T_repair_base_sp = 0.65 * cm_time_sp
+    T_repair_sp = T_repair_base_sp * (1.0 - delta_sp)
+    for i, e in enumerate(echelon_sp):
+        if e == "O":
+            T_reminst_sp[i] *= 0.85
+            T_repair_sp[i] *= 0.75
+        elif e == "D":
+            T_reminst_sp[i] *= 1.15
+            T_repair_sp[i] *= 1.25
+    T_restore_base_sp = T_reminst_sp + (1.0 - condemn_sp) * T_repair_sp
+
+    T_restore_intrinsic_sp, shortage_exposure_sp, restore_split_sp, exposure_split_sp = apply_repairable_time_split(
+        T_restore_base_sp,
+        lead_sp,
+        repairable_sp,
+        replace_time_sp,
+        repair_tat_sp,
+        config,
+    )
+
+    T_issue_O_sp = np.full(len(spare_idx), 0.3, dtype=float)
+    T_issue_I_sp = np.maximum(0.8, np.minimum(4.0, 0.25 * np.maximum(transport_sp, 1.0)))
+    T_issue_D_sp = np.maximum(1.5, np.minimum(8.0, 0.45 * np.maximum(transport_sp, 1.0)))
+
+    baseline_wait_sp = np.zeros(len(spare_idx), dtype=float)
+    for i, e in enumerate(echelon_sp):
+        frac = BASELINE_WAIT_FRACTION_BY_ECHELON.get(e, 0.35)
+        floor = MIN_WAIT_FLOOR_H_BY_ECHELON.get(e, 2.0)
+        baseline_wait_sp[i] = max(floor, frac * shortage_exposure_sp[i])
+
+    p_need_sp = 1.0 - np.exp(-np.clip(lambda_period_sp, 0.0, None))
+    ll_pct = float(config.long_lead_percentile * 100.0 if config.long_lead_percentile <= 1.0 else config.long_lead_percentile)
+    ai_pct = float(config.ao_impact_percentile * 100.0 if config.ao_impact_percentile <= 1.0 else config.ao_impact_percentile)
+    long_core_pct = float(config.long_core_impact_percentile * 100.0 if config.long_core_impact_percentile <= 1.0 else config.long_core_impact_percentile)
+    ll_pct = float(np.clip(ll_pct, 0.0, 100.0))
+    ai_pct = float(np.clip(ai_pct, 0.0, 100.0))
+    long_core_pct = float(np.clip(long_core_pct, 0.0, 100.0))
+
+    thr_lead = float(np.nanpercentile(shortage_exposure_sp, ll_pct)) if len(shortage_exposure_sp) else 0.0
+    is_long_sp = shortage_exposure_sp >= thr_lead
+    impact_sp = lambda_eff_sp * np.maximum(T_diag_sp + baseline_wait_sp + T_restore_intrinsic_sp, 1e-9) / hours_per_year
+    thr_impact = float(np.nanpercentile(impact_sp, ai_pct)) if len(impact_sp) else 0.0
+    is_high_impact_sp = impact_sp >= thr_impact
+
+    # CHANGE 4: latest candidate rule using period need, long lead, Ao impact, and long-core intersection.
+    pmin_mask_sp = p_need_sp >= float(config.pmin)
+    long_core_mask_sp = is_long_sp & is_high_impact_sp
+    candidate_mask = pmin_mask_sp | is_high_impact_sp | is_long_sp | long_core_mask_sp
+    candidate_idx_local = np.where(candidate_mask)[0]
+    if len(candidate_idx_local) == 0:
+        # Stability fallback: keep optimization executable for unusual test inputs.
+        candidate_idx_local = np.argsort(-impact_sp)[: min(len(spare_idx), max(1, int(config.population_size)))]
+    if len(candidate_idx_local) == 0:
+        candidate_idx_local = np.arange(len(spare_idx), dtype=int)
+
+    part_id_c = part_id_sp[candidate_idx_local]
+    parent_id_c = parent_id_sp[candidate_idx_local]
+    level_c = level_sp[candidate_idx_local]
+    depth_c = depth_sp[candidate_idx_local]
+    echelon_c = echelon_sp[candidate_idx_local]
+    fr_raw_c = fr_raw_sp[candidate_idx_local]
+    lambda_item_c = lambda_item_sp[candidate_idx_local]
+    annual_fr_c = lambda_system_sp[candidate_idx_local]       # existing key: annual system lambda after PM
+    lambda_eff_c = lambda_eff_sp[candidate_idx_local]         # existing key consumed by simulator
+    lambda_demand_c = lambda_demand_sp[candidate_idx_local]
+    lam_period_c = lambda_period_sp[candidate_idx_local]       # canonical analysis-period demand
+    proc_cost_c = proc_cost_sp[candidate_idx_local]
+    lead_c = lead_sp[candidate_idx_local]
+    cm_cost_c = cm_cost_sp[candidate_idx_local]
+    T_diag_c = T_diag_sp[candidate_idx_local]
+    T_reminst_c = T_reminst_sp[candidate_idx_local]
+    T_repair_c = T_repair_sp[candidate_idx_local]
+    T_restore_intrinsic_c = T_restore_intrinsic_sp[candidate_idx_local]
+    T_issue_O_c = T_issue_O_sp[candidate_idx_local]
+    T_issue_I_c = T_issue_I_sp[candidate_idx_local]
+    T_issue_D_c = T_issue_D_sp[candidate_idx_local]
+    baseline_wait_c = baseline_wait_sp[candidate_idx_local]
+    shortage_exposure_c = shortage_exposure_sp[candidate_idx_local]
+    p_need_c = p_need_sp[candidate_idx_local]
+    impact_c = impact_sp[candidate_idx_local]
+    is_long_c = is_long_sp[candidate_idx_local]
+    is_high_impact_c = is_high_impact_sp[candidate_idx_local]
+    is_pmin_over_c = pmin_mask_sp[candidate_idx_local]
+    long_core_mask_c = long_core_mask_sp[candidate_idx_local]
+    qpa_c = qpa_sp[candidate_idx_local]
+    repairable_c = repairable_sp[candidate_idx_local]
+    replace_time_c = replace_time_sp[candidate_idx_local]
+    repair_tat_c = repair_tat_sp[candidate_idx_local]
+    restore_split_c = restore_split_sp[candidate_idx_local]
+    exposure_split_c = exposure_split_sp[candidate_idx_local]
+
+    m_cand = len(candidate_idx_local)
+    long_idx_c = np.where(is_long_c)[0]
+    long_core_thr = float(np.nanpercentile(impact_c[long_idx_c], long_core_pct)) if len(long_idx_c) > 0 else 0.0
+
+    prebuy_flag_c = np.zeros(m_cand, dtype=bool)
+    protection_flag_c = np.zeros(m_cand, dtype=bool)
+    for j in range(m_cand):
+        if is_long_c[j] and (is_pmin_over_c[j] or is_high_impact_c[j]):
+            prebuy_flag_c[j] = True
+        if is_long_c[j] and ((impact_c[j] >= long_core_thr) or long_core_mask_c[j]):
+            protection_flag_c[j] = True
+
+    impact_rank_c = percentile_rank_array(impact_c)
+    critical_weight_c = np.where(impact_rank_c >= 0.80, 1.00, np.where(impact_rank_c >= 0.50, 0.45, 0.15))
+
+    mu_pipe_nom_c = lambda_demand_c * shortage_exposure_c / HOURS_PER_YEAR
+    stock_cap_c = stock_cap_from_pipeline_mu(mu_pipe_nom_c, lam_period_c, is_long_c, repairable_c, config)
+    prot_floor_c = np.where(protection_flag_c, 1, 0).astype(int)
+    base_maint_spend = float(np.sum(annual_fr_c * cm_cost_c * period_years))
+
+    prepared_out = df_prepared.copy()
+    prepared_out["is_spare_demand"] = False
+    prepared_out.loc[spare_idx, "is_spare_demand"] = True
+    prepared_out["candidate"] = False
+    prepared_out.loc[spare_idx[candidate_idx_local], "candidate"] = True
+    prepared_out["lambda_item_annual"] = 0.0
+    prepared_out.loc[spare_idx, "lambda_item_annual"] = lambda_item_sp
+    prepared_out["lambda_system_annual"] = 0.0
+    prepared_out.loc[spare_idx, "lambda_system_annual"] = lambda_system_sp
+    prepared_out["lambda_demand_annual"] = 0.0
+    prepared_out.loc[spare_idx, "lambda_demand_annual"] = lambda_demand_sp
+    prepared_out["lambda_period_demand"] = 0.0
+    prepared_out.loc[spare_idx, "lambda_period_demand"] = lambda_period_sp
+    prepared_out["p_need_period"] = 0.0
+    prepared_out.loc[spare_idx, "p_need_period"] = p_need_sp
+    # Backward-compatible alias for older app.py views only.
+    prepared_out["p_need_2y"] = prepared_out["p_need_period"]
+    prepared_out["impact_score"] = 0.0
+    prepared_out.loc[spare_idx, "impact_score"] = impact_sp
+    prepared_out["shortage_exposure_h"] = 0.0
+    prepared_out.loc[spare_idx, "shortage_exposure_h"] = shortage_exposure_sp
+    prepared_out["restore_used_h"] = 0.0
+    prepared_out.loc[spare_idx, "restore_used_h"] = T_restore_intrinsic_sp
+    prepared_out["is_long_lead"] = False
+    prepared_out.loc[spare_idx, "is_long_lead"] = is_long_sp
+    prepared_out["is_high_ao_impact"] = False
+    prepared_out.loc[spare_idx, "is_high_ao_impact"] = is_high_impact_sp
+    prepared_out["is_pmin_over"] = False
+    prepared_out.loc[spare_idx, "is_pmin_over"] = pmin_mask_sp
+    prepared_out["restore_split_applied"] = False
+    prepared_out.loc[spare_idx, "restore_split_applied"] = restore_split_sp
+    prepared_out["exposure_split_applied"] = False
+    prepared_out.loc[spare_idx, "exposure_split_applied"] = exposure_split_sp
+
+    candidate_reason = []
+    for pmin_ok, long_ok, impact_ok, long_core_ok in zip(is_pmin_over_c, is_long_c, is_high_impact_c, long_core_mask_c):
+        reasons = []
+        if pmin_ok:
+            reasons.append("p_need")
+        if long_ok:
+            reasons.append("long_lead")
+        if impact_ok:
+            reasons.append("ao_impact")
+        if long_core_ok:
+            reasons.append("long_core")
+        candidate_reason.append("+".join(reasons) if reasons else "fallback")
+
+    candidate_df = pd.DataFrame({
+        "part_id": part_id_c,
+        "parent_id": parent_id_c,
+        "level_num": level_c,
+        "depth": depth_c,
+        "maint_echelon": echelon_c,
+        "failure_rate_raw": fr_raw_c,
+        "failure_rate_adj": annual_fr_c,
+        "lambda_item_annual": lambda_item_c,
+        "lambda_system_annual": annual_fr_c,
+        "lambda_demand_annual": lambda_demand_c,
+        "lambda_period_demand": lam_period_c,
+        "lambda_eff": lambda_eff_c,
+        "lambda_period": lam_period_c,
+        "proc_cost": proc_cost_c,
+        "lead_time": lead_c,
+        "cm_cost": cm_cost_c,
+        "T_diag_h": T_diag_c,
+        "T_restore_intrinsic_h": T_restore_intrinsic_c,
+        "restore_used_h": T_restore_intrinsic_c,
+        "baseline_wait_h": baseline_wait_c,
+        "shortage_exposure_h": shortage_exposure_c,
+        "p_need_period": p_need_c,
+        # Backward-compatible alias for older app.py views only.
+        "p_need_2y": p_need_c,
+        "impact_score": impact_c,
+        "ao_impact_rank_weight": impact_rank_c,
+        "is_long_lead": is_long_c,
+        "is_high_ao_impact": is_high_impact_c,
+        "is_pmin_over": is_pmin_over_c,
+        "candidate_reason": candidate_reason,
+        "prebuy_flag": prebuy_flag_c,
+        "protection_flag": protection_flag_c,
+        "critical_weight": critical_weight_c,
+        "stock_cap": stock_cap_c,
+        "prot_floor": prot_floor_c,
+        "qpa": qpa_c,
+        "repairable_flag": repairable_c,
+        "replace_time_h": replace_time_c,
+        "repair_tat_h": repair_tat_c,
+        "restore_split_applied": restore_split_c,
+        "exposure_split_applied": exposure_split_c,
+    })
+
+    return {
+        "prepared_df": prepared_out.reset_index(drop=True),
+        "candidate_df": candidate_df.reset_index(drop=True),
+        "m_cand": m_cand,
+        "part_id_c": part_id_c,
+        "parent_id_c": parent_id_c,
+        "level_c": level_c,
+        "depth_c": depth_c,
+        "echelon_c": echelon_c,
+        "annual_fr_c": annual_fr_c,
+        "lambda_eff_c": lambda_eff_c,
+        "lambda_demand_c": lambda_demand_c,
+        "lambda_item_c": lambda_item_c,
+        "lambda_period_c": lam_period_c,
+        "proc_cost_c": proc_cost_c,
+        "lead_c": lead_c,
+        "cm_cost_c": cm_cost_c,
+        "T_diag_c": T_diag_c,
+        "T_reminst_c": T_reminst_c,
+        "T_repair_c": T_repair_c,
+        "T_restore_intrinsic_c": T_restore_intrinsic_c,
+        "T_issue_O_c": T_issue_O_c,
+        "T_issue_I_c": T_issue_I_c,
+        "T_issue_D_c": T_issue_D_c,
+        "baseline_wait_c": baseline_wait_c,
+        "shortage_exposure_c": shortage_exposure_c,
+        "p_need_c": p_need_c,
+        "impact_c": impact_c,
+        "impact_rank_c": impact_rank_c,
+        "is_long_c": is_long_c,
+        "prebuy_flag_c": prebuy_flag_c,
+        "protection_flag_c": protection_flag_c,
+        "critical_weight_c": critical_weight_c,
+        "stock_cap_c": stock_cap_c,
+        "prot_floor_c": prot_floor_c,
+        "base_maint_spend": base_maint_spend,
+        "period_years": period_years,
+        "hours_per_year": hours_per_year,
+        "t_obs_hours": t_obs_hours,
+        "rep_target": float(config.representative_target),
+        "target_grid": [float(x) for x in config.ao_target_grid],
+    }
+
+def prepare_input_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df_prepared = _prepare_engine_dataframe(df_raw)
+    preview_config = NSGAConfig()
+    try:
+        ctx = _build_engine_context(df_prepared, preview_config)
+        return ctx["prepared_df"]
+    except Exception:
+        df_prepared["candidate"] = False
+        df_prepared["is_spare_demand"] = False
+        df_prepared["p_need_2y"] = 0.0
+        df_prepared["impact_score"] = 0.0
+        df_prepared["is_long_lead"] = False
+        df_prepared["is_high_ao_impact"] = False
+        df_prepared["is_pmin_over"] = False
+        return df_prepared
+
+
+def _build_poisson_tail_table(mu_vec: np.ndarray, stock_cap_vec: np.ndarray) -> np.ndarray:
+    mu_arr = np.asarray(mu_vec, dtype=float)
+    cap_arr = np.asarray(stock_cap_vec, dtype=int)
+    if mu_arr.size == 0:
+        return np.zeros((0, 1), dtype=float)
+    max_cap = int(np.max(cap_arr)) if cap_arr.size else 0
+    table = np.zeros((mu_arr.size, max_cap + 1), dtype=float)
+    for i, mu in enumerate(mu_arr):
+        cap_i = int(cap_arr[i])
+        for s in range(cap_i + 1):
+            table[i, s] = poisson_tail_prob(float(mu), int(s))
+        if cap_i < max_cap:
+            table[i, cap_i + 1:] = table[i, cap_i]
+    return table
+
+
+def _build_poisson_ebo_table(mu_vec: np.ndarray, stock_cap_vec: np.ndarray) -> np.ndarray:
+    """Build EBO lookup table for stock 0..max_cap for each candidate."""
+    mu_arr = np.asarray(mu_vec, dtype=float)
+    cap_arr = np.asarray(stock_cap_vec, dtype=int)
+    if mu_arr.size == 0:
+        return np.zeros((0, 1), dtype=float)
+    max_cap = int(np.max(cap_arr)) if cap_arr.size else 0
+    table = np.zeros((mu_arr.size, max_cap + 1), dtype=float)
+    for i, mu in enumerate(mu_arr):
+        cap_i = int(cap_arr[i])
+        for s_i in range(max_cap + 1):
+            # Keep values beyond each item cap stable at the cap value.
+            st = min(int(s_i), cap_i)
+            table[i, s_i] = poisson_ebo_scalar(float(mu), st)
+    return table
+
+
+def _ensure_sim_cache(ctx: Dict[str, object]) -> None:
+    if ctx.get("_sim_cache_ready", False):
+        return
+    lambda_eff_c = np.asarray(ctx["lambda_eff_c"], dtype=float)
+    T_issue_O_c = np.asarray(ctx["T_issue_O_c"], dtype=float)
+    T_issue_I_c = np.asarray(ctx["T_issue_I_c"], dtype=float)
+    T_issue_D_c = np.asarray(ctx["T_issue_D_c"], dtype=float)
+    stock_cap_c = np.asarray(ctx["stock_cap_c"], dtype=int)
+    echelon_c = np.asarray(ctx["echelon_c"], dtype=object)
+    critical_weight_c = np.asarray(ctx["critical_weight_c"], dtype=float)
+    T_diag_c = np.asarray(ctx["T_diag_c"], dtype=float)
+    T_restore_intrinsic_c = np.asarray(ctx["T_restore_intrinsic_c"], dtype=float)
+
+    ctx["_lambda_cw"] = (lambda_eff_c * critical_weight_c).astype(float)
+    ctx["_dt_diag_const"] = float(np.sum(lambda_eff_c * T_diag_c * critical_weight_c))
+    ctx["_dt_restore_const"] = float(np.sum(lambda_eff_c * T_restore_intrinsic_c * critical_weight_c))
+    ctx["_prebuy_flag_bool"] = np.asarray(ctx["prebuy_flag_c"], dtype=bool)
+    ctx["_protection_flag_bool"] = np.asarray(ctx["protection_flag_c"], dtype=bool)
+    ctx["_echelon_is_O"] = echelon_c == "O"
+    ctx["_echelon_is_I"] = echelon_c == "I"
+    ctx["_echelon_is_D"] = echelon_c == "D"
+    hours_per_year = max(float(ctx.get("hours_per_year", HOURS_PER_YEAR)), 1e-9)
+    ctx["_p_short_table_O"] = _build_poisson_tail_table(lambda_eff_c * T_issue_O_c / hours_per_year, stock_cap_c)
+    ctx["_p_short_table_I"] = _build_poisson_tail_table(lambda_eff_c * T_issue_I_c / hours_per_year, stock_cap_c)
+    ctx["_p_short_table_D"] = _build_poisson_tail_table(lambda_eff_c * T_issue_D_c / hours_per_year, stock_cap_c)
+
+    # CHANGE 5: residual shortage exposure cache for F2.
+    period_years = max(float(ctx.get("period_years", YEARS)), 1e-9)
+    lambda_period_c = np.asarray(ctx.get("lambda_period_c", lambda_eff_c * period_years), dtype=float)
+    shortage_exposure_c = np.asarray(ctx.get("shortage_exposure_c", np.ones_like(lambda_period_c)), dtype=float)
+    impact_rank_c = np.asarray(ctx.get("impact_rank_c", percentile_rank_array(lambda_eff_c)), dtype=float)
+    residual_weight_c = np.nan_to_num(shortage_exposure_c, nan=0.0, posinf=0.0, neginf=0.0) * (0.25 + 0.75 * np.nan_to_num(impact_rank_c, nan=0.0))
+    ctx["_ebo_table_period"] = _build_poisson_ebo_table(lambda_period_c, stock_cap_c)
+    ctx["_residual_weight_c"] = residual_weight_c.astype(float)
+    baseline_ebo = poisson_ebo_array(lambda_period_c, np.zeros_like(stock_cap_c, dtype=int))
+    baseline_residual = float(np.sum(baseline_ebo * residual_weight_c))
+    ctx["_baseline_residual_shortage_exposure"] = max(baseline_residual, 1e-12)
+    ctx["_sim_cache_ready"] = True
+
+
+def _simulate_population(
+    ctx: Dict[str, object],
+    Y_in: np.ndarray,
+    SO_in: np.ndarray,
+    SI_in: np.ndarray,
+    SD_in: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    _ensure_sim_cache(ctx)
+    Y = np.asarray(Y_in, dtype=int).copy()
+    SO = np.asarray(SO_in, dtype=int).copy()
+    SI = np.asarray(SI_in, dtype=int).copy()
+    SD = np.asarray(SD_in, dtype=int).copy()
+    if Y.ndim == 1:
+        Y = Y.reshape(1, -1)
+        SO = SO.reshape(1, -1)
+        SI = SI.reshape(1, -1)
+        SD = SD.reshape(1, -1)
+
+    m_cand = int(ctx["m_cand"])
+    prot_floor_c = np.asarray(ctx["prot_floor_c"], dtype=int)
+    stock_cap_c = np.asarray(ctx["stock_cap_c"], dtype=int)
+
+    SO = Y * SO
+    SI = Y * SI
+    SD = Y * SD
+    total_stock = SO + SI + SD
+
+    need_floor = (Y > 0) & (prot_floor_c.reshape(1, -1) > 0) & (total_stock < 1)
+    if np.any(need_floor):
+        SO = SO + (need_floor & np.asarray(ctx["_echelon_is_O"], dtype=bool).reshape(1, -1)).astype(int)
+        SI = SI + (need_floor & np.asarray(ctx["_echelon_is_I"], dtype=bool).reshape(1, -1)).astype(int)
+        SD = SD + (need_floor & np.asarray(ctx["_echelon_is_D"], dtype=bool).reshape(1, -1)).astype(int)
+
+    total_stock = SO + SI + SD
+    excess = np.maximum(total_stock - stock_cap_c.reshape(1, -1), 0)
+    reduc_D = np.minimum(SD, excess)
+    SD -= reduc_D
+    excess -= reduc_D
+    reduc_I = np.minimum(SI, excess)
+    SI -= reduc_I
+    excess -= reduc_I
+    reduc_O = np.minimum(SO, excess)
+    SO -= reduc_O
+    total_stock = SO + SI + SD
+
+    item_idx = np.arange(m_cand)
+    p_short_O = ctx["_p_short_table_O"][item_idx.reshape(1, -1), np.clip(SO, 0, ctx["_p_short_table_O"].shape[1] - 1)]
+    p_short_I = ctx["_p_short_table_I"][item_idx.reshape(1, -1), np.clip(SI, 0, ctx["_p_short_table_I"].shape[1] - 1)]
+    p_short_D = ctx["_p_short_table_D"][item_idx.reshape(1, -1), np.clip(SD, 0, ctx["_p_short_table_D"].shape[1] - 1)]
+
+    unmanaged_mask = (Y <= 0)
+    p_short_O = np.where(unmanaged_mask, 1.0, p_short_O)
+    p_short_I = np.where(unmanaged_mask, 1.0, p_short_I)
+    p_short_D = np.where(unmanaged_mask, 1.0, p_short_D)
+
+    lambda_cw = np.asarray(ctx["_lambda_cw"], dtype=float).reshape(1, -1)
+
+    # PERIOD Ao/DT FIX
+    # lambda_eff is annual, therefore these DT components are annual expected hours.
+    dt_diag_annual = np.full(Y.shape[0], float(ctx["_dt_diag_const"]), dtype=float)
+    dt_restore_annual = np.full(Y.shape[0], float(ctx["_dt_restore_const"]), dtype=float)
+    dt_wait_annual = np.sum(
+        lambda_cw * (
+            p_short_O * np.asarray(ctx["T_issue_O_c"]).reshape(1, -1)
+            + p_short_I * np.asarray(ctx["T_issue_I_c"]).reshape(1, -1)
+            + p_short_D * np.asarray(ctx["T_issue_D_c"]).reshape(1, -1)
+        ),
+        axis=1,
+    )
+    dt_total_annual = dt_diag_annual + dt_wait_annual + dt_restore_annual
+
+    period_years = max(float(ctx.get("period_years", YEARS)), 1e-9)
+    hours_per_year = max(float(ctx.get("hours_per_year", HOURS_PER_YEAR)), 1e-9)
+    t_obs_hours = max(float(ctx.get("t_obs_hours", period_years * hours_per_year)), 1e-9)
+
+    # Expand every annual DT component to the same analysis period as T_obs.
+    dt_diag = dt_diag_annual * period_years
+    dt_wait = dt_wait_annual * period_years
+    dt_restore = dt_restore_annual * period_years
+    dt_total = dt_total_annual * period_years
+
+    # Operational availability: T_obs / (T_obs + downtime over the same period).
+    ao = t_obs_hours / (t_obs_hours + dt_total)
+    ao = np.clip(ao, 0.0, 1.0)
+
+    proc_cost = np.asarray(ctx["proc_cost_c"], dtype=float).reshape(1, -1)
+    cm_cost = np.asarray(ctx["cm_cost_c"], dtype=float).reshape(1, -1)
+    annual_fr = np.asarray(ctx["annual_fr_c"], dtype=float).reshape(1, -1)
+    total_cost = np.sum(total_stock * proc_cost, axis=1) + float(ctx.get("base_maint_spend", 0.0))
+    maint_cost = np.sum(annual_fr * cm_cost, axis=1)
+    total_cost = total_cost + maint_cost
+
+    managed_parts = np.sum(Y > 0, axis=1).astype(float)
+    total_stock_sum = np.sum(total_stock, axis=1).astype(float)
+
+    # CHANGE 5: residual shortage exposure = sum EBO_i(q_i) * exposure_i * impact_rank_weight_i.
+    item_idx = np.arange(m_cand)
+    ebo_table = np.asarray(ctx.get("_ebo_table_period"), dtype=float)
+    residual_weight = np.asarray(ctx.get("_residual_weight_c"), dtype=float).reshape(1, -1)
+    ebo_selected = ebo_table[item_idx.reshape(1, -1), np.clip(total_stock, 0, ebo_table.shape[1] - 1)]
+    residual_shortage_exposure = np.sum(ebo_selected * residual_weight, axis=1).astype(float)
+    baseline_residual = float(ctx.get("_baseline_residual_shortage_exposure", 1.0))
+    residual_shortage_exposure_scaled = residual_shortage_exposure / max(baseline_residual, 1e-12)
+
+    return {
+        "Y": Y,
+        "SO": SO,
+        "SI": SI,
+        "SD": SD,
+        "total_stock_matrix": total_stock,
+        "total_stock": total_stock_sum,
+        "managed_parts": managed_parts,
+        "total_cost": total_cost,
+        "Ao": ao,
+        # Existing DT_*_h keys now consistently mean full analysis-period DT.
+        "DT_total_h": dt_total,
+        "DT_diag_h": dt_diag,
+        "DT_wait_h": dt_wait,
+        "DT_restore_h": dt_restore,
+        # Additive annual diagnostics for audit/reporting.
+        "DT_total_annual_h": dt_total_annual,
+        "DT_diag_annual_h": dt_diag_annual,
+        "DT_wait_annual_h": dt_wait_annual,
+        "DT_restore_annual_h": dt_restore_annual,
+        "residual_shortage_exposure": residual_shortage_exposure,
+        "residual_shortage_exposure_scaled": residual_shortage_exposure_scaled,
+    }
+
+
+def _random_population(ctx: Dict[str, object], config: NSGAConfig, rng: np.random.Generator, n_pop: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    m = int(ctx["m_cand"])
+    stock_cap = np.asarray(ctx["stock_cap_c"], dtype=int)
+    prebuy = np.asarray(ctx["prebuy_flag_c"], dtype=bool)
+    protection = np.asarray(ctx["protection_flag_c"], dtype=bool)
+    p_need = np.asarray(ctx["p_need_c"], dtype=float)
+    impact = minmax(np.asarray(ctx["impact_c"], dtype=float))
+    score = np.clip(0.35 + 0.40 * minmax(p_need) + 0.25 * impact + 0.20 * prebuy.astype(float) + 0.25 * protection.astype(float), 0.05, 0.95)
+
+    Y = (rng.random((n_pop, m)) < score.reshape(1, -1)).astype(int)
+    SO = np.zeros((n_pop, m), dtype=int)
+    SI = np.zeros((n_pop, m), dtype=int)
+    SD = np.zeros((n_pop, m), dtype=int)
+    echelon = np.asarray(ctx["echelon_c"], dtype=object)
+    for j in range(m):
+        cap = max(1, int(stock_cap[j]))
+        quantities = rng.integers(0, cap + 1, size=n_pop)
+        if protection[j]:
+            quantities = np.maximum(quantities, 1)
+        if echelon[j] == "O":
+            SO[:, j] = quantities
+        elif echelon[j] == "I":
+            SI[:, j] = quantities
+        else:
+            SD[:, j] = quantities
+    return Y, SO, SI, SD
+
+
+def _extract_solution(sim: Dict[str, np.ndarray], idx: int) -> Dict[str, object]:
+    return {
+        "Y": sim["Y"][idx].copy(),
+        "SO": sim["SO"][idx].copy(),
+        "SI": sim["SI"][idx].copy(),
+        "SD": sim["SD"][idx].copy(),
+        "Ao": float(sim["Ao"][idx]),
+        "total_cost": float(sim["total_cost"][idx]),
+        "DT_total_h": float(sim["DT_total_h"][idx]),
+        "DT_diag_h": float(sim["DT_diag_h"][idx]),
+        "DT_wait_h": float(sim["DT_wait_h"][idx]),
+        "DT_restore_h": float(sim["DT_restore_h"][idx]),
+        "DT_total_annual_h": float(sim["DT_total_annual_h"][idx]),
+        "DT_diag_annual_h": float(sim["DT_diag_annual_h"][idx]),
+        "DT_wait_annual_h": float(sim["DT_wait_annual_h"][idx]),
+        "DT_restore_annual_h": float(sim["DT_restore_annual_h"][idx]),
+        "managed_parts": float(sim["managed_parts"][idx]),
+        "total_stock": float(sim["total_stock"][idx]),
+        "residual_shortage_exposure": float(sim.get("residual_shortage_exposure", np.zeros_like(sim["total_stock"]))[idx]),
+        "residual_shortage_exposure_scaled": float(sim.get("residual_shortage_exposure_scaled", np.zeros_like(sim["total_stock"]))[idx]),
+    }
+
+
+def _run_nsga_single_target(
+    ctx: Dict[str, object],
+    config: NSGAConfig,
+    ao_target: float,
+    seed: int,
+    progress_callback: Optional[Callable[[int, int, Dict[str, float]], None]] = None,
+) -> Dict[str, object]:
+    rng = np.random.default_rng(seed)
+    n_pop = max(int(config.population_size), 8)
+    n_gen = max(int(config.n_generations), 1)
+
+    best_solutions: List[Dict[str, object]] = []
+    history_rows: List[Dict[str, float]] = []
+    elite: Optional[Dict[str, object]] = None
+
+    for gen in range(1, n_gen + 1):
+        Y, SO, SI, SD = _random_population(ctx, config, rng, n_pop)
+        if elite is not None and n_pop > 0:
+            Y[0, :] = elite["Y"]
+            SO[0, :] = elite["SO"]
+            SI[0, :] = elite["SI"]
+            SD[0, :] = elite["SD"]
+        sim = _simulate_population(ctx, Y, SO, SI, SD)
+        ao_shortfall = np.maximum(0.0, float(ao_target) - sim["Ao"])
+        f1 = sim["total_cost"] + float(config.ao_cost_penalty) * ao_shortfall
+
+        # CHANGE 5: latest Ground-style F2.
+        # Keep the previous small complexity terms for stability, but make residual shortage
+        # exposure the dominant secondary risk term when enabled.
+        complexity_term = (
+            float(config.item_count_weight) * sim["managed_parts"] * 1e-4
+            + float(config.stock_unit_weight) * sim["total_stock"] * 1e-4
+        )
+        if bool(getattr(config, "use_residual_shortage_exposure_f2", True)):
+            residual_term = float(getattr(config, "residual_shortage_exposure_weight", 0.10)) * sim.get("residual_shortage_exposure_scaled", 0.0)
+        else:
+            residual_term = 0.0
+        f2 = ao_shortfall + residual_term + complexity_term
+        score = f1 + f2 * float(config.ao_cost_penalty)
+        best_idx = int(np.argmin(score))
+        elite = _extract_solution(sim, best_idx)
+        best_solutions.append(elite)
+        history_rows.append({
+            "generation": gen,
+            "target_ao": float(ao_target),
+            "best_Ao": float(elite["Ao"]),
+            "best_cost": float(elite["total_cost"]),
+            "best_total_stock": float(elite["total_stock"]),
+            "best_managed_parts": float(elite["managed_parts"]),
+        })
+        if progress_callback is not None:
+            progress_callback(gen, n_gen, history_rows[-1])
+
+    # Pareto-like unique elite set from generation bests.
+    unique: Dict[str, Dict[str, object]] = {}
+    for sol in best_solutions:
+        sig = solution_signature(sol["Y"], sol["SO"], sol["SI"], sol["SD"])
+        cur = unique.get(sig)
+        if cur is None or sol["Ao"] > cur["Ao"] or sol["total_cost"] < cur["total_cost"]:
+            unique[sig] = sol
+    pareto_solutions = list(unique.values())
+    if not pareto_solutions and elite is not None:
+        pareto_solutions = [elite]
+
+    feasible = [s for s in pareto_solutions if float(s["Ao"]) >= float(ao_target)]
+    if feasible:
+        best = min(feasible, key=lambda s: (float(s["total_cost"]), float(s["total_stock"])))
+    else:
+        best = max(pareto_solutions, key=lambda s: (float(s["Ao"]), -float(s["total_cost"])))
+
+    return {
+        "target_ao": float(ao_target),
+        "history_df": pd.DataFrame(history_rows),
+        "pareto_solutions": pareto_solutions,
+        "best_solution": best,
+    }
+
+
+def _collect_run_dataframe(ctx: Dict[str, object], res_t: Dict[str, object]) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+    target = float(res_t.get("target_ao", np.nan))
+    for sol in res_t.get("pareto_solutions", []):
+        rows.append({
+            "target_ao": target,
+            "Ao": float(sol["Ao"]),
+            "total_cost": float(sol["total_cost"]),
+            "DT_total_h": float(sol["DT_total_h"]),
+            "DT_diag_h": float(sol["DT_diag_h"]),
+            "DT_wait_h": float(sol["DT_wait_h"]),
+            "DT_restore_h": float(sol["DT_restore_h"]),
+            "DT_total_annual_h": float(sol.get("DT_total_annual_h", 0.0)),
+            "DT_diag_annual_h": float(sol.get("DT_diag_annual_h", 0.0)),
+            "DT_wait_annual_h": float(sol.get("DT_wait_annual_h", 0.0)),
+            "DT_restore_annual_h": float(sol.get("DT_restore_annual_h", 0.0)),
+            "managed_parts": float(sol["managed_parts"]),
+            "total_stock": float(sol["total_stock"]),
+            "residual_shortage_exposure": float(sol.get("residual_shortage_exposure", 0.0)),
+            "residual_shortage_exposure_scaled": float(sol.get("residual_shortage_exposure_scaled", 0.0)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_policy_df(ctx: Dict[str, object], sol: Dict[str, object]) -> pd.DataFrame:
+    Y = np.asarray(sol["Y"], dtype=int)
+    SO = np.asarray(sol["SO"], dtype=int)
+    SI = np.asarray(sol["SI"], dtype=int)
+    SD = np.asarray(sol["SD"], dtype=int)
+    total_stock = SO + SI + SD
+    prebuy_bool = np.asarray(ctx["prebuy_flag_c"], dtype=bool)
+    protection_bool = np.asarray(ctx["protection_flag_c"], dtype=bool)
+    priority_score = minmax(np.asarray(ctx["impact_c"], dtype=float)) * 0.7 + minmax(np.asarray(ctx["p_need_c"], dtype=float)) * 0.3
+    manage_flag = (Y > 0).astype(int)
+    reorder_signal = np.where((manage_flag > 0) & (total_stock <= np.asarray(ctx["prot_floor_c"], dtype=int)), "CHECK", "")
+    df_policy = pd.DataFrame({
+        "part_id": ctx["part_id_c"],
+        "parent_id": ctx["parent_id_c"],
+        "level_num": ctx["level_c"],
+        "maint_echelon": ctx["echelon_c"],
+        "manage_flag": manage_flag,
+        "recommended_stock": total_stock,
+        "stock_O": SO,
+        "stock_I": SI,
+        "stock_D": SD,
+        "total_stock": total_stock,
+        "unit_cost": ctx["proc_cost_c"],
+        "expected_demand_period": ctx["lambda_period_c"],
+        "p_need_period": ctx["p_need_c"],
+        # Backward-compatible aliases for older app.py views only.
+        "expected_demand_2y": ctx["lambda_period_c"],
+        "p_need_2y": ctx["p_need_c"],
+        "lead_time": ctx["lead_c"],
+        "impact_score": ctx["impact_c"],
+        "priority_score": priority_score,
+        "prebuy_flag": prebuy_bool,
+        "protection_flag": protection_bool,
+        "selected_prebuy_unit": np.where((prebuy_bool) & (total_stock > 0), total_stock, 0),
+        "selected_protection_unit": np.where((protection_bool) & (total_stock > 0), total_stock, 0),
+        "normal_stock_unit": np.where((~prebuy_bool) & (~protection_bool) & (total_stock > 0), total_stock, 0),
+        "qpa": ctx["candidate_df"]["qpa"].to_numpy() if "qpa" in ctx["candidate_df"].columns else 1.0,
+        "repairable_flag": ctx["candidate_df"]["repairable_flag"].to_numpy() if "repairable_flag" in ctx["candidate_df"].columns else 0,
+        "replace_time_h": ctx["candidate_df"]["replace_time_h"].to_numpy() if "replace_time_h" in ctx["candidate_df"].columns else 0.0,
+        "repair_tat_h": ctx["candidate_df"]["repair_tat_h"].to_numpy() if "repair_tat_h" in ctx["candidate_df"].columns else 0.0,
+        "reorder_signal": reorder_signal,
+    })
+    return df_policy.sort_values(by=["manage_flag", "priority_score", "recommended_stock"], ascending=[False, False, False]).reset_index(drop=True)
+
+
+def _build_final_spares_df(ctx: Dict[str, object], sol: Dict[str, object]) -> pd.DataFrame:
+    """Additive final spare table for latest Ground-style reporting."""
+    policy = _build_policy_df(ctx, sol).copy()
+    policy["final_initial_spare_qty"] = policy["recommended_stock"].astype(int)
+    candidate_df = ctx.get("candidate_df", pd.DataFrame()).copy()
+    keep_cols = [
+        "part_id", "lambda_item_annual", "lambda_system_annual", "lambda_demand_annual",
+        "lambda_period_demand", "p_need_period", "shortage_exposure_h", "stock_cap",
+        "candidate_reason",
+    ]
+    merge_cols = [c for c in keep_cols if c in candidate_df.columns]
+    if merge_cols and "part_id" in merge_cols:
+        policy = policy.merge(candidate_df[merge_cols].drop_duplicates("part_id"), on="part_id", how="left")
+    return policy.reset_index(drop=True)
+
+
+def _build_repairable_audit_df(ctx: Dict[str, object]) -> pd.DataFrame:
+    """Audit table for repairable time-split logic. Additive only; app.py can ignore it."""
+    cand = ctx.get("candidate_df", pd.DataFrame()).copy()
+    cols = [
+        "part_id", "parent_id", "level_num", "maint_echelon", "repairable_flag",
+        "replace_time_h", "repair_tat_h", "restore_used_h", "shortage_exposure_h",
+        "restore_split_applied", "exposure_split_applied", "stock_cap",
+    ]
+    existing = [c for c in cols if c in cand.columns]
+    if not existing:
+        return pd.DataFrame(columns=cols)
+    return cand[existing].reset_index(drop=True)
+
+
+def _build_diagnostic_df(ctx: Dict[str, object]) -> pd.DataFrame:
+    """Diagnostic table exposing upgraded calculation quantities."""
+    cand = ctx.get("candidate_df", pd.DataFrame()).copy()
+    cols = [
+        "part_id", "parent_id", "level_num", "maint_echelon", "failure_rate", "qpa",
+        "lambda_item_annual", "lambda_system_annual", "lambda_demand_annual",
+        "lambda_period_demand", "p_need_period", "impact_score", "impact_rank",
+        "is_long_lead", "is_high_ao_impact", "is_pmin_over", "long_core_flag",
+        "candidate_reason", "stock_cap",
+    ]
+    existing = [c for c in cols if c in cand.columns]
+    if not existing:
+        return pd.DataFrame(columns=cols)
+    return cand[existing].reset_index(drop=True)
+
+
+def run_nsga2(
+    df_input: pd.DataFrame,
+    config: Optional[NSGAConfig] = None,
+    progress_callback: Optional[Callable[[int, int, Dict[str, float]], None]] = None,
+) -> Dict[str, object]:
+    start_time = time.time()
+    if config is None:
+        config = NSGAConfig()
+
+    df_prepared_base = _prepare_engine_dataframe(df_input)
+    ctx = _build_engine_context(df_prepared_base, config)
+
+    result_map: Dict[float, Dict[str, object]] = {}
+    all_runs: List[pd.DataFrame] = []
+    histories: List[pd.DataFrame] = []
+
+    rep_target = float(config.representative_target)
+    target_grid = [float(t) for t in config.ao_target_grid]
+    if rep_target not in target_grid:
+        target_grid.append(rep_target)
+        target_grid = sorted(set(target_grid))
+
+    for idx, target in enumerate(target_grid):
+        run_seed = int(config.random_seed + idx * 17)
+        wrapped_callback = None
+        if progress_callback is not None:
+            stage_idx = int(idx + 1)
+            stage_total = int(len(target_grid))
+            current_target = float(target)
+            is_rep = abs(current_target - rep_target) < 1e-12
+            total_gen = int(config.n_generations)
+            progress_callback(0, total_gen, {
+                "event": "stage_start",
+                "current_target_ao": current_target,
+                "sweep_stage_idx": stage_idx,
+                "sweep_stage_total": stage_total,
+                "representative_target": rep_target,
+                "is_representative_target": is_rep,
+                "stage_progress": 0.0,
+                "overall_progress": float((stage_idx - 1) / max(stage_total, 1)),
+            })
+
+            def wrapped_callback(gen, total_gen, best_summary, *, _stage_idx=stage_idx, _stage_total=stage_total, _current_target=current_target, _rep_target=rep_target, _is_rep=is_rep):
+                payload = dict(best_summary)
+                frac = float(gen / max(total_gen, 1))
+                payload.update({
+                    "event": "generation",
+                    "current_target_ao": _current_target,
+                    "sweep_stage_idx": _stage_idx,
+                    "sweep_stage_total": _stage_total,
+                    "representative_target": _rep_target,
+                    "is_representative_target": _is_rep,
+                    "stage_progress": frac,
+                    "overall_progress": float(((_stage_idx - 1) + frac) / max(_stage_total, 1)),
+                })
+                progress_callback(gen, total_gen, payload)
+
+        res_t = _run_nsga_single_target(ctx=ctx, config=config, ao_target=target, seed=run_seed, progress_callback=wrapped_callback)
+        result_map[round(target, 6)] = res_t
+        run_df = _collect_run_dataframe(ctx, res_t)
+        all_runs.append(run_df)
+        hist = res_t["history_df"].copy()
+        histories.append(hist)
+
+    rep_key = round(rep_target, 6)
+    if rep_key not in result_map:
+        rep_key = sorted(result_map.keys())[-1]
+    rep_res = result_map[rep_key]
+    best_sol = rep_res["best_solution"]
+
+    all_target_runs_df = pd.concat(all_runs, ignore_index=True) if all_runs else pd.DataFrame()
+    history_df = pd.concat(histories, ignore_index=True) if histories else pd.DataFrame()
+    pareto_df = _collect_run_dataframe(ctx, rep_res)
+    policy_df = _build_policy_df(ctx, best_sol)
+
+    sweep_rows = []
+    for target, res in result_map.items():
+        best = res["best_solution"]
+        sweep_rows.append({
+            "target_ao": float(target),
+            "best_Ao": float(best["Ao"]),
+            "best_cost": float(best["total_cost"]),
+            "best_total_stock": float(best["total_stock"]),
+            "best_managed_parts": float(best["managed_parts"]),
+            "best_residual_shortage_exposure": float(best.get("residual_shortage_exposure", 0.0)),
+            "best_residual_shortage_exposure_scaled": float(best.get("residual_shortage_exposure_scaled", 0.0)),
+            "n_pareto": int(len(res.get("pareto_solutions", []))),
+        })
+    sweep_summary_df = pd.DataFrame(sweep_rows).sort_values("target_ao").reset_index(drop=True)
+
+    summary = {
+        "target_ao": float(rep_target),
+        "best_Ao": float(best_sol["Ao"]),
+        "best_cost": float(best_sol["total_cost"]),
+        "DT_total_h": float(best_sol["DT_total_h"]),
+        "DT_diag_h": float(best_sol["DT_diag_h"]),
+        "DT_wait_h": float(best_sol["DT_wait_h"]),
+        "DT_restore_h": float(best_sol["DT_restore_h"]),
+        "DT_total_annual_h": float(best_sol.get("DT_total_annual_h", 0.0)),
+        "DT_diag_annual_h": float(best_sol.get("DT_diag_annual_h", 0.0)),
+        "DT_wait_annual_h": float(best_sol.get("DT_wait_annual_h", 0.0)),
+        "DT_restore_annual_h": float(best_sol.get("DT_restore_annual_h", 0.0)),
+        "analysis_years": float(ctx.get("period_years", config.years)),
+        "hours_per_year": float(ctx.get("hours_per_year", config.hours_per_year)),
+        "T_obs_hours": float(ctx.get("t_obs_hours", config.years * config.hours_per_year)),
+        "managed_parts": float(best_sol["managed_parts"]),
+        "total_stock": float(best_sol["total_stock"]),
+        "residual_shortage_exposure": float(best_sol.get("residual_shortage_exposure", 0.0)),
+        "residual_shortage_exposure_scaled": float(best_sol.get("residual_shortage_exposure_scaled", 0.0)),
+        "candidate_parts": int(ctx["m_cand"]),
+        "elapsed_sec": float(time.time() - start_time),
+        "engine_step": "change1_2_3_4_5_6_plus_PERIOD_AoDT_FIX",
+    }
+
+    final_spares_df = _build_final_spares_df(ctx, best_sol)
+    repairable_audit_df = _build_repairable_audit_df(ctx)
+    diagnostic_df = _build_diagnostic_df(ctx)
+
+    result = {
+        "summary": summary,
+        "prepared_df": ctx["prepared_df"],
+        "candidate_df": ctx["candidate_df"],
+        "history_df": history_df,
+        "pareto_df": pareto_df,
+        "policy_df": policy_df,
+        "sweep_summary_df": sweep_summary_df,
+        "all_target_runs_df": all_target_runs_df,
+        # CHANGE 6: additive tables. Existing app.py keys above are untouched.
+        "final_spares_df": final_spares_df,
+        "repairable_audit_df": repairable_audit_df,
+        "diagnostic_df": diagnostic_df,
+        # Extra diagnostics are additive and do not break app.py.
+        "logs": [
+            "CHANGE 1 applied: NSGAConfig extended for latest Ground model settings.",
+            "CHANGE 2 applied: QPA/Repairable/Replace/TAT columns preserved in prepared/candidate data.",
+            "CHANGE 3 applied: _build_engine_context now uses annual lambda, QPA, Fleet Size, p_need, and repairable time split.",
+            "CHANGE 4 applied: candidate selection uses p_need_period, long lead, Ao impact, and long-core rules.",
+            "CHANGE 5 applied: F2 includes Poisson EBO based residual shortage exposure when enabled.",
+            "CHANGE 6 applied: final_spares_df, repairable_audit_df, diagnostic_df are returned additively.",
+        ],
+    }
+    return result
+
+
+__all__ = ["NSGAConfig", "prepare_input_dataframe", "run_nsga2"]
