@@ -1,0 +1,49 @@
+SUPPLY DECISION DASHBOARD V5 VALIDATION REPORT
+================================================
+
+1. NSGA 진행표 자동추적
+----------------------
+- 상단 Target 상태표: 현재 진행 Target Ao를 중심으로 7행 이동창 표시
+- 하단 세대 로그표: 현재 Generation이 항상 마지막에 보이도록 최근 11행 이동창 표시
+- 브라우저 내부 스크롤바를 강제로 조작하지 않고 현재 행이 항상 보이는 안정적 방식 사용
+- 상/하단 현재행 음영: 연한 초록색 #E8F5E9
+
+2. 핵심 의사결정 지도
+--------------------
+- 전략영역 배경색을 매우 연하게 조정
+- 주 그래프 높이 790px로 확대
+- 기존 3개 관점 유지: 비용-평균즉시충족률 / 비용-보수안정성 / 추가비용-위험감소
+
+3. 추가 PBL 필수 관계 차트
+--------------------------
+- 비용 ↔ 재고부족 발생확률
+- 재고수량 ↔ 재고부족 발생확률
+- 비용 ↔ Worst Ao
+- 전략 상향 시 추가 1억원당 한계 Risk 감소효과
+- 전략 전환별 추가비용 / Risk 감소 / 1억원당 Risk 감소 표
+
+4. 미래 시뮬레이션 설명
+----------------------
+- 입력 RAM 고장률을 고정값으로만 사용하지 않고 품목별 K를 반복마다 적용
+- K ~ LogNormal, P05≈0.5 / Median=1.0 / P95≈2.0
+- Demand_i ~ Poisson(기준 연간고장수요 × K × 기간)
+- 동일 미래수요를 모든 전략에 공통 적용(CRN)
+- Repairable: Repair TAT / Non-repairable: Lead Time 보충주기
+- 기본 3,000회 반복 결과를 서비스·Shortage 분포로 표시
+
+APP SHA256: d6b02e5d42b1102e4f5f73443c9c23536aa90b63f5a0d11f6fd3b9d41e7bf7cc
+
+Static Checks
+-------------
+syntax: PASS
+auto_follow_top: PASS
+auto_follow_bottom: PASS
+both_green: PASS
+region_very_light: PASS
+main_map_height_790: PASS
+mc_uncertainty_explanation: PASS
+k_distribution_explanation: PASS
+cost_shortage_chart: PASS
+stock_shortage_chart: PASS
+cost_worst_ao_chart: PASS
+marginal_value_chart: PASS
