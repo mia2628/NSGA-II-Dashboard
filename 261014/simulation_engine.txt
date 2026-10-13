@@ -1,0 +1,639 @@
+# simulation_engine.py
+# -*- coding: utf-8 -*-
+"""Monte Carlo future-risk validation aligned to the NSGA nominal evaluator.
+
+STEP 5 principles
+------------------
+1) Keep the validated NSGA optimizer untouched.
+2) Reuse the same annual failure intensity, shortage probability logic,
+   diagnosis/restore time, issue time, baseline wait and criticality weights
+   that the NSGA evaluator uses.
+3) Compare alternatives A/B under the same sampled future failure scenarios.
+4) Keep the stress-test configuration internal to the model; user-facing UI focuses on results.
+5) Preserve all 10,000 scenario rows for graphing and add criticality-weighted shortage risk.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple
+import math
+
+import numpy as np
+import pandas as pd
+
+
+DEFAULT_MC_ITERATIONS = 10_000
+DEFAULT_MC_SEED = 42
+DEFAULT_STRESS_FACTOR = 1.10
+
+
+@dataclass(frozen=True)
+class MonteCarloConfig:
+    iterations: int = DEFAULT_MC_ITERATIONS
+    random_seed: int = DEFAULT_MC_SEED
+    # Deliberate stress-test setting. 1.10 = 10% higher future failure intensity.
+    stress_factor: float = DEFAULT_STRESS_FACTOR
+    # Retained for backward compatibility; remains disabled until calibrated.
+    failure_rate_lognormal_sigma: float = 0.0
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        out = float(v)
+        return out if np.isfinite(out) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _parse_solution_key(key: str) -> Tuple[float, int]:
+    left, right = str(key).strip().split("|", 1)
+    return float(left), int(right)
+
+
+def _get_solution_vector(result: Dict[str, Any], solution_key: str) -> Dict[str, Any]:
+    target_ao, solution_id = _parse_solution_key(solution_key)
+    result_map = result.get("result_map")
+    if not isinstance(result_map, dict):
+        raise ValueError("NSGA result_map is unavailable.")
+
+    one = result_map.get(round(float(target_ao), 6))
+    if not isinstance(one, dict):
+        raise KeyError(f"Target Ao {target_ao:.6f} is unavailable.")
+
+    sim = one.get("sim_pop")
+    if not isinstance(sim, dict):
+        raise ValueError("Selected-solution simulation population is unavailable.")
+
+    ao_arr = np.asarray(sim.get("Ao", []), dtype=float)
+    idx = int(solution_id)
+    if idx < 0 or idx >= len(ao_arr):
+        raise IndexError(f"solution_id {idx} is out of range.")
+
+    def row(name: str, dtype=float):
+        arr = np.asarray(sim[name], dtype=dtype)
+        return arr[idx].copy() if arr.ndim >= 2 else arr[idx]
+
+    return {
+        "target_ao": float(target_ao),
+        "solution_id": idx,
+        "Ao_nominal": float(ao_arr[idx]),
+        "stock_cost": float(np.asarray(sim.get("stock_cost", np.zeros(len(ao_arr))), dtype=float)[idx]),
+        "total_cost": float(np.asarray(sim.get("total_cost", np.zeros(len(ao_arr))), dtype=float)[idx]),
+        "total_stock_units": int(np.asarray(sim.get("total_stock_units", np.zeros(len(ao_arr))), dtype=int)[idx]),
+        "stocked_managed_parts": int(np.asarray(sim.get("stocked_managed_parts", np.zeros(len(ao_arr))), dtype=int)[idx]),
+        "Y": row("Y", int),
+        "sD": row("sD", int),
+    }
+
+
+def validate_monte_carlo_inputs(result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"ready": False, "reason": "NSGA 실행결과가 없습니다."}
+    ctx = result.get("_engine_context")
+    result_map = result.get("result_map")
+    if not isinstance(ctx, dict) or not isinstance(result_map, dict):
+        return {"ready": False, "reason": "Monte Carlo에 필요한 NSGA 내부 결과가 없습니다."}
+
+    required = [
+        "lambda_eff_c", "lambda_eff_demand_c", "T_diag_c", "T_restore_intrinsic_c",
+        "T_issue_D_c", "baseline_wait_c", "shortage_exposure_c", "critical_weight_c",
+        "t_obs_hours", "period_years", "hours_per_year", "m_cand",
+    ]
+    missing = [k for k in required if k not in ctx]
+    if missing:
+        return {"ready": False, "reason": "필수 컨텍스트 누락: " + ", ".join(missing)}
+
+    return {
+        "ready": True,
+        "candidate_count": int(ctx.get("m_cand", 0)),
+        "analysis_years": float(ctx.get("analysis_years", ctx.get("period_years", 0.0))),
+        "analysis_hours": float(ctx.get("t_obs_hours", 0.0)),
+    }
+
+
+def _poisson_tail_gt_s(mu: np.ndarray, stock: np.ndarray) -> np.ndarray:
+    """P(Poisson(mu) > stock), matching the NSGA D-level shortage table semantics."""
+    mu = np.clip(np.asarray(mu, dtype=float), 0.0, None)
+    stock = np.maximum(np.asarray(stock, dtype=int), 0)
+    out = np.zeros_like(mu, dtype=float)
+
+    for i in range(len(mu)):
+        m = float(mu[i])
+        s = int(stock[i])
+        if m <= 0.0:
+            out[i] = 0.0
+            continue
+        if m > 700.0:
+            out[i] = 1.0
+            continue
+        term = math.exp(-m)
+        cdf = term
+        for k in range(1, s + 1):
+            term *= m / float(k)
+            cdf += term
+        out[i] = float(np.clip(1.0 - cdf, 0.0, 1.0))
+    return out
+
+
+def _shortage_probability(
+    lambda_eff_demand: np.ndarray,
+    shortage_exposure_h: np.ndarray,
+    hours_per_year: float,
+    stock: np.ndarray,
+    managed: np.ndarray,
+    stress_factor: float,
+) -> np.ndarray:
+    mu = (
+        np.clip(lambda_eff_demand, 0.0, None)
+        * max(float(stress_factor), 0.0)
+        * np.clip(shortage_exposure_h, 0.0, None)
+        / max(float(hours_per_year), 1e-9)
+    )
+    p = _poisson_tail_gt_s(mu, stock)
+    # Canonical NSGA logic: unmanaged items receive baseline waiting risk.
+    return np.where(managed, p, 1.0).astype(float)
+
+
+def _draw_multiplier(rng: np.random.Generator, sigma: float) -> float:
+    sigma = max(float(sigma), 0.0)
+    if sigma <= 0.0:
+        return 1.0
+    return float(rng.lognormal(mean=0.0, sigma=sigma))
+
+
+def run_ab_monte_carlo(
+    result: Dict[str, Any],
+    a_key: str,
+    b_key: str,
+    config: MonteCarloConfig | None = None,
+) -> Dict[str, Any]:
+    cfg = config if isinstance(config, MonteCarloConfig) else MonteCarloConfig()
+    iterations = int(cfg.iterations)
+    if iterations <= 0:
+        raise ValueError("iterations must be positive.")
+
+    readiness = validate_monte_carlo_inputs(result)
+    if not readiness.get("ready"):
+        raise ValueError(str(readiness.get("reason", "Monte Carlo inputs are not ready.")))
+
+    ctx = result["_engine_context"]
+    A = _get_solution_vector(result, a_key)
+    B = _get_solution_vector(result, b_key)
+
+    m = int(ctx["m_cand"])
+    stock_a = np.asarray(A["sD"], dtype=int).reshape(-1)
+    stock_b = np.asarray(B["sD"], dtype=int).reshape(-1)
+    managed_a = np.asarray(A["Y"], dtype=int).reshape(-1) > 0
+    managed_b = np.asarray(B["Y"], dtype=int).reshape(-1) > 0
+    if any(len(x) != m for x in [stock_a, stock_b, managed_a, managed_b]):
+        raise ValueError("A/B decision vector length does not match the NSGA candidate universe.")
+
+    lambda_system = np.clip(np.asarray(ctx["lambda_eff_c"], dtype=float).reshape(-1), 0.0, None)
+    lambda_demand = np.clip(np.asarray(ctx["lambda_eff_demand_c"], dtype=float).reshape(-1), 0.0, None)
+    t_diag = np.clip(np.asarray(ctx["T_diag_c"], dtype=float).reshape(-1), 0.0, None)
+    t_restore = np.clip(np.asarray(ctx["T_restore_intrinsic_c"], dtype=float).reshape(-1), 0.0, None)
+    t_issue = np.clip(np.asarray(ctx["T_issue_D_c"], dtype=float).reshape(-1), 0.0, None)
+    baseline_wait = np.clip(np.asarray(ctx["baseline_wait_c"], dtype=float).reshape(-1), 0.0, None)
+    exposure = np.clip(np.asarray(ctx["shortage_exposure_c"], dtype=float).reshape(-1), 0.0, None)
+    critical = np.clip(np.asarray(ctx["critical_weight_c"], dtype=float).reshape(-1), 0.0, None)
+    # CM_Cost_KRW per candidate. Used only for realized-maintenance reporting;
+    # a shortage event is excluded because maintenance could not be executed in that event.
+    cm_cost = np.clip(np.asarray(ctx.get("cm_cost_c", np.zeros(m)), dtype=float).reshape(-1), 0.0, None)
+    if len(cm_cost) != m:
+        cm_cost = np.zeros(m, dtype=float)
+    period_years = max(float(ctx["period_years"]), 1e-9)
+    hours_per_year = max(float(ctx["hours_per_year"]), 1e-9)
+    horizon_h = max(float(ctx["t_obs_hours"]), 1e-9)
+
+    arrays = [lambda_system, lambda_demand, t_diag, t_restore, t_issue, baseline_wait, exposure, critical]
+    if any(len(x) != m for x in arrays):
+        raise ValueError("Monte Carlo context arrays are not aligned with the candidate universe.")
+
+    stress = max(float(cfg.stress_factor), 0.0)
+    rng = np.random.default_rng(int(cfg.random_seed))
+
+    scenario_id = np.arange(1, iterations + 1, dtype=int)
+    ao_a = np.empty(iterations, dtype=float)
+    ao_b = np.empty(iterations, dtype=float)
+    dt_wait_a = np.empty(iterations, dtype=float)
+    dt_wait_b = np.empty(iterations, dtype=float)
+    shortage_a = np.empty(iterations, dtype=int)
+    shortage_b = np.empty(iterations, dtype=int)
+    shortage_rate_a = np.empty(iterations, dtype=float)
+    shortage_rate_b = np.empty(iterations, dtype=float)
+    weighted_shortage_rate_a = np.empty(iterations, dtype=float)
+    weighted_shortage_rate_b = np.empty(iterations, dtype=float)
+    total_failures = np.empty(iterations, dtype=int)
+    realized_maint_cost_a = np.empty(iterations, dtype=float)
+    realized_maint_cost_b = np.empty(iterations, dtype=float)
+    k_used = np.empty(iterations, dtype=float)
+
+    # Explainable AI: actual item-level Monte Carlo aggregation.
+    # These counters are accumulated from the same A/B common-random-number scenarios,
+    # so item contribution charts are based on simulated shortages, not a heuristic score.
+    item_demand_events = np.zeros(m, dtype=np.int64)
+    item_shortage_a = np.zeros(m, dtype=np.int64)
+    item_shortage_b = np.zeros(m, dtype=np.int64)
+
+    batch_size = 250
+    for start in range(0, iterations, batch_size):
+        end = min(start + batch_size, iterations)
+        b = end - start
+
+        if float(cfg.failure_rate_lognormal_sigma) > 0.0:
+            k_batch = np.array([_draw_multiplier(rng, cfg.failure_rate_lognormal_sigma) for _ in range(b)], dtype=float)
+        else:
+            k_batch = np.ones(b, dtype=float)
+        k_used[start:end] = k_batch
+
+        lam_batch = (lambda_system * period_years * stress).reshape(1, -1) * k_batch.reshape(-1, 1)
+        counts = rng.poisson(lam_batch)
+        total_f = counts.sum(axis=1).astype(int)
+        total_failures[start:end] = total_f
+
+        # If epistemic K is activated later, recompute shortage probabilities per row.
+        if float(cfg.failure_rate_lognormal_sigma) > 0.0:
+            shortA = np.zeros_like(counts, dtype=int)
+            shortB = np.zeros_like(counts, dtype=int)
+            for r in range(b):
+                pA = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_a, managed_a, stress * k_batch[r])
+                pB = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_b, managed_b, stress * k_batch[r])
+                shortA[r] = rng.binomial(counts[r], pA)
+                shortB[r] = rng.binomial(counts[r], pB)
+        else:
+            pA = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_a, managed_a, stress)
+            pB = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_b, managed_b, stress)
+            shortA = rng.binomial(counts, pA.reshape(1, -1))
+            shortB = rng.binomial(counts, pB.reshape(1, -1))
+
+        item_demand_events += counts.sum(axis=0).astype(np.int64)
+        item_shortage_a += shortA.sum(axis=0).astype(np.int64)
+        item_shortage_b += shortB.sum(axis=0).astype(np.int64)
+
+        shortage_a[start:end] = shortA.sum(axis=1).astype(int)
+        shortage_b[start:end] = shortB.sum(axis=1).astype(int)
+        # Realized maintenance cost: only maintenance events that can actually be executed
+        # with available spares are costed. Events blocked by shortage are excluded.
+        realized_maint_cost_a[start:end] = np.sum(np.maximum(counts - shortA, 0) * cm_cost.reshape(1, -1), axis=1)
+        realized_maint_cost_b[start:end] = np.sum(np.maximum(counts - shortB, 0) * cm_cost.reshape(1, -1), axis=1)
+        denom = np.maximum(total_f, 1)
+        shortage_rate_a[start:end] = shortA.sum(axis=1) / denom
+        shortage_rate_b[start:end] = shortB.sum(axis=1) / denom
+
+        weighted_demand = np.sum(counts * critical.reshape(1, -1), axis=1)
+        weighted_denom = np.maximum(weighted_demand, 1e-12)
+        weighted_shortage_rate_a[start:end] = np.sum(shortA * critical.reshape(1, -1), axis=1) / weighted_denom
+        weighted_shortage_rate_b[start:end] = np.sum(shortB * critical.reshape(1, -1), axis=1) / weighted_denom
+
+        diag = np.sum(counts * (t_diag * critical).reshape(1, -1), axis=1)
+        restore = np.sum(counts * (t_restore * critical).reshape(1, -1), axis=1)
+        waitA = np.sum(((counts - shortA) * t_issue.reshape(1, -1) + shortA * baseline_wait.reshape(1, -1)) * critical.reshape(1, -1), axis=1)
+        waitB = np.sum(((counts - shortB) * t_issue.reshape(1, -1) + shortB * baseline_wait.reshape(1, -1)) * critical.reshape(1, -1), axis=1)
+
+        dt_wait_a[start:end] = waitA
+        dt_wait_b[start:end] = waitB
+        ao_a[start:end] = np.clip(horizon_h / (horizon_h + diag + waitA + restore), 0.0, 1.0)
+        ao_b[start:end] = np.clip(horizon_h / (horizon_h + diag + waitB + restore), 0.0, 1.0)
+
+    df = pd.DataFrame({
+        "simulation_no": scenario_id,
+        "failure_multiplier_k": k_used,
+        "total_failures": total_failures,
+        "A_Ao": ao_a,
+        "B_Ao": ao_b,
+        "A_DT_wait_h": dt_wait_a,
+        "B_DT_wait_h": dt_wait_b,
+        "A_shortage_events": shortage_a,
+        "B_shortage_events": shortage_b,
+        "A_shortage_rate": shortage_rate_a,
+        "B_shortage_rate": shortage_rate_b,
+        "A_weighted_shortage_rate": weighted_shortage_rate_a,
+        "B_weighted_shortage_rate": weighted_shortage_rate_b,
+        "A_shortage_flag": shortage_a > 0,
+        "B_shortage_flag": shortage_b > 0,
+        "A_realized_maintenance_cost": realized_maint_cost_a,
+        "B_realized_maintenance_cost": realized_maint_cost_b,
+        # backward-compatible aliases for the next UI step
+        "A_shortage_units": shortage_a,
+        "B_shortage_units": shortage_b,
+    })
+
+    def summary(prefix: str, sol: Dict[str, Any]) -> Dict[str, Any]:
+        ao = df[f"{prefix}_Ao"].to_numpy(dtype=float)
+        shortage = df[f"{prefix}_shortage_events"].to_numpy(dtype=int)
+        shortage_rate = df[f"{prefix}_shortage_rate"].to_numpy(dtype=float)
+        weighted_shortage_rate = df[f"{prefix}_weighted_shortage_rate"].to_numpy(dtype=float)
+        wait = df[f"{prefix}_DT_wait_h"].to_numpy(dtype=float)
+        short_flag = shortage > 0
+        realized_maint = df[f"{prefix}_realized_maintenance_cost"].to_numpy(dtype=float)
+        return {
+            "target_ao": float(sol["target_ao"]),
+            "solution_id": int(sol["solution_id"]),
+            "nominal_Ao": float(sol["Ao_nominal"]),
+            "stock_cost": float(sol["stock_cost"]),
+            "total_cost": float(sol["total_cost"]),
+            "stocked_managed_parts": int(sol["stocked_managed_parts"]),
+            "total_stock_units": int(sol["total_stock_units"]),
+            "mean_Ao": float(np.mean(ao)),
+            "median_Ao": float(np.median(ao)),
+            "min_Ao": float(np.min(ao)),
+            "max_Ao": float(np.max(ao)),
+            "Ao_drop_from_nominal": float(sol["Ao_nominal"] - np.mean(ao)),
+            "target_Ao_achievement_count": int(np.sum(ao >= float(sol["target_ao"]))),
+            "target_Ao_achievement_rate": float(np.mean(ao >= float(sol["target_ao"]))),
+            "shortage_scenario_count": int(np.sum(short_flag)),
+            "no_shortage_scenario_count": int(np.sum(~short_flag)),
+            "shortage_scenario_rate": float(np.mean(short_flag)),
+            "mean_shortage_events": float(np.mean(shortage)),
+            "median_shortage_events": float(np.median(shortage)),
+            "max_shortage_events": int(np.max(shortage)),
+            "mean_shortage_rate": float(np.mean(shortage_rate)),
+            "mean_weighted_shortage_rate": float(np.mean(weighted_shortage_rate)),
+            "mean_total_failures": float(np.mean(total_failures)),
+            "mean_DT_wait_h": float(np.mean(wait)),
+            "mean_realized_maintenance_cost": float(np.mean(realized_maint)),
+            "median_realized_maintenance_cost": float(np.median(realized_maint)),
+            # backward-compatible key; semantically these are shortage events, not physical stock units
+            "mean_shortage_units": float(np.mean(shortage)),
+        }
+
+    item_denom = np.maximum(item_demand_events.astype(float), 1.0)
+    item_risk_df = pd.DataFrame({
+        "candidate_index": np.arange(m, dtype=int),
+        "demand_events": item_demand_events.astype(np.int64),
+        "A_shortage_events": item_shortage_a.astype(np.int64),
+        "B_shortage_events": item_shortage_b.astype(np.int64),
+        "A_shortage_rate": item_shortage_a / item_denom,
+        "B_shortage_rate": item_shortage_b / item_denom,
+        # Positive => A experienced fewer shortages than B for this item.
+        "B_minus_A_shortage_events": (item_shortage_b - item_shortage_a).astype(np.int64),
+        "B_minus_A_shortage_rate": (item_shortage_b - item_shortage_a) / item_denom,
+        "critical_weight": critical.astype(float),
+        "lead_time_h": np.asarray(ctx.get("lead_c", np.zeros(m)), dtype=float).reshape(-1),
+        "cm_cost_krw": cm_cost.astype(float),
+    })
+
+    summary_a = summary("A", A)
+    summary_b = summary("B", B)
+    comparison = {
+        "additional_stock_cost_B_minus_A": float(summary_b["stock_cost"] - summary_a["stock_cost"]),
+        "additional_total_cost_B_minus_A": float(summary_b["total_cost"] - summary_a["total_cost"]),
+        "mean_Ao_B_minus_A": float(summary_b["mean_Ao"] - summary_a["mean_Ao"]),
+        "shortage_scenario_reduction_A_minus_B": int(summary_a["shortage_scenario_count"] - summary_b["shortage_scenario_count"]),
+        "mean_shortage_events_reduction_A_minus_B": float(summary_a["mean_shortage_events"] - summary_b["mean_shortage_events"]),
+        "mean_shortage_rate_reduction_A_minus_B": float(summary_a["mean_shortage_rate"] - summary_b["mean_shortage_rate"]),
+        "mean_weighted_shortage_rate_reduction_A_minus_B": float(summary_a["mean_weighted_shortage_rate"] - summary_b["mean_weighted_shortage_rate"]),
+        "realized_maintenance_cost_B_minus_A": float(summary_b["mean_realized_maintenance_cost"] - summary_a["mean_realized_maintenance_cost"]),
+    }
+
+    return {
+        "config": {
+            "iterations": iterations,
+            "random_seed": int(cfg.random_seed),
+            "stress_factor": stress,
+            "stress_percent": (stress - 1.0) * 100.0,
+            "failure_rate_lognormal_sigma": float(cfg.failure_rate_lognormal_sigma),
+            "common_random_numbers": True,
+            "uncertainty_mode": "Poisson future failures + canonical NSGA shortage probability",
+        },
+        "A": summary_a,
+        "B": summary_b,
+        "comparison": comparison,
+        "scenario_df": df,
+        "item_risk_df": item_risk_df,
+    }
+
+
+def run_multi_item_stock_whatif(
+    result: Dict[str, Any],
+    a_key: str,
+    b_key: str,
+    base_label: str,
+    adjustments: list[dict[str, int]] | tuple[dict[str, int], ...],
+    config: MonteCarloConfig | None = None,
+) -> Dict[str, Any]:
+    """Re-simulate a multi-item stock reinforcement package under the same future stream.
+
+    ``adjustments`` is a sequence of ``{"candidate_index": int, "add_units": int}``.
+    All selected items are changed simultaneously, so the returned After policy is one
+    coherent counterfactual inventory policy rather than a sum of independent effects.
+
+    The original A/B common-random-number stream is replayed.  For every changed item,
+    counterfactual shortage events are obtained by monotone thinning of that item's
+    baseline shortage events.  Therefore adding stock cannot create extra shortage
+    events merely because a new random draw happened to be worse.
+    """
+    cfg = config if isinstance(config, MonteCarloConfig) else MonteCarloConfig()
+    iterations = int(cfg.iterations)
+    if iterations <= 0:
+        raise ValueError("iterations must be positive.")
+    readiness = validate_monte_carlo_inputs(result)
+    if not readiness.get("ready"):
+        raise ValueError(str(readiness.get("reason", "Monte Carlo inputs are not ready.")))
+    base_label = str(base_label).upper().strip()
+    if base_label not in {"A", "B"}:
+        raise ValueError("base_label must be A or B.")
+
+    ctx = result["_engine_context"]
+    A = _get_solution_vector(result, a_key)
+    B = _get_solution_vector(result, b_key)
+    m = int(ctx["m_cand"])
+
+    # Normalize, validate, and merge duplicate item selections.
+    merged: dict[int, int] = {}
+    for rec in list(adjustments or []):
+        if not isinstance(rec, dict):
+            continue
+        j = int(rec.get("candidate_index", -1))
+        u = int(rec.get("add_units", 0))
+        if j < 0 or j >= m:
+            raise IndexError(f"candidate_index is out of range: {j}")
+        if u <= 0:
+            continue
+        merged[j] = merged.get(j, 0) + u
+    if not merged:
+        raise ValueError("At least one positive stock reinforcement is required.")
+    changed = np.asarray(sorted(merged.keys()), dtype=int)
+
+    stock_a = np.asarray(A["sD"], dtype=int).reshape(-1)
+    stock_b = np.asarray(B["sD"], dtype=int).reshape(-1)
+    managed_a = np.asarray(A["Y"], dtype=int).reshape(-1) > 0
+    managed_b = np.asarray(B["Y"], dtype=int).reshape(-1) > 0
+    base_stock = stock_a.copy() if base_label == "A" else stock_b.copy()
+    base_managed = managed_a.copy() if base_label == "A" else managed_b.copy()
+    cf_stock = base_stock.copy()
+    cf_managed = base_managed.copy()
+    for j, u in merged.items():
+        cf_stock[j] += int(u)
+        cf_managed[j] = True
+
+    lambda_system = np.clip(np.asarray(ctx["lambda_eff_c"], dtype=float).reshape(-1), 0.0, None)
+    lambda_demand = np.clip(np.asarray(ctx["lambda_eff_demand_c"], dtype=float).reshape(-1), 0.0, None)
+    t_diag = np.clip(np.asarray(ctx["T_diag_c"], dtype=float).reshape(-1), 0.0, None)
+    t_restore = np.clip(np.asarray(ctx["T_restore_intrinsic_c"], dtype=float).reshape(-1), 0.0, None)
+    t_issue = np.clip(np.asarray(ctx["T_issue_D_c"], dtype=float).reshape(-1), 0.0, None)
+    baseline_wait = np.clip(np.asarray(ctx["baseline_wait_c"], dtype=float).reshape(-1), 0.0, None)
+    exposure = np.clip(np.asarray(ctx["shortage_exposure_c"], dtype=float).reshape(-1), 0.0, None)
+    critical = np.clip(np.asarray(ctx["critical_weight_c"], dtype=float).reshape(-1), 0.0, None)
+    period_years = max(float(ctx["period_years"]), 1e-9)
+    hours_per_year = max(float(ctx["hours_per_year"]), 1e-9)
+    horizon_h = max(float(ctx["t_obs_hours"]), 1e-9)
+    stress = max(float(cfg.stress_factor), 0.0)
+
+    rng = np.random.default_rng(int(cfg.random_seed))
+    # Stable seed derived from the whole package. Re-running the same package is identical.
+    sig = sum((j + 1) * 1009 + merged[j] * 9176 for j in changed.tolist())
+    rng_cf = np.random.default_rng(int(cfg.random_seed) + 104729 + sig + (0 if base_label == "A" else 1))
+
+    base_ao = np.empty(iterations, dtype=float); cf_ao = np.empty(iterations, dtype=float)
+    base_wait_out = np.empty(iterations, dtype=float); cf_wait_out = np.empty(iterations, dtype=float)
+    base_short_out = np.empty(iterations, dtype=int); cf_short_out = np.empty(iterations, dtype=int)
+    total_failures = np.empty(iterations, dtype=int)
+
+    batch_size = 250
+    for start_i in range(0, iterations, batch_size):
+        end_i = min(start_i + batch_size, iterations); b = end_i - start_i
+        if float(cfg.failure_rate_lognormal_sigma) > 0.0:
+            k_batch = np.array([_draw_multiplier(rng, cfg.failure_rate_lognormal_sigma) for _ in range(b)], dtype=float)
+        else:
+            k_batch = np.ones(b, dtype=float)
+        lam_batch = (lambda_system * period_years * stress).reshape(1, -1) * k_batch.reshape(-1, 1)
+        counts = rng.poisson(lam_batch)
+        total_failures[start_i:end_i] = counts.sum(axis=1).astype(int)
+
+        if float(cfg.failure_rate_lognormal_sigma) > 0.0:
+            shortA = np.zeros_like(counts, dtype=int); shortB = np.zeros_like(counts, dtype=int)
+            p_base_rows = np.zeros((b, len(changed)), dtype=float)
+            p_cf_rows = np.zeros((b, len(changed)), dtype=float)
+            for r in range(b):
+                sf = stress * k_batch[r]
+                pA = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_a, managed_a, sf)
+                pB = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_b, managed_b, sf)
+                shortA[r] = rng.binomial(counts[r], pA); shortB[r] = rng.binomial(counts[r], pB)
+                pb = _shortage_probability(lambda_demand, exposure, hours_per_year, base_stock, base_managed, sf)
+                pc = _shortage_probability(lambda_demand, exposure, hours_per_year, cf_stock, cf_managed, sf)
+                p_base_rows[r, :] = pb[changed]
+                p_cf_rows[r, :] = pc[changed]
+        else:
+            pA = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_a, managed_a, stress)
+            pB = _shortage_probability(lambda_demand, exposure, hours_per_year, stock_b, managed_b, stress)
+            shortA = rng.binomial(counts, pA.reshape(1, -1)); shortB = rng.binomial(counts, pB.reshape(1, -1))
+            pb = _shortage_probability(lambda_demand, exposure, hours_per_year, base_stock, base_managed, stress)
+            pc = _shortage_probability(lambda_demand, exposure, hours_per_year, cf_stock, cf_managed, stress)
+            p_base_rows = np.tile(pb[changed].reshape(1, -1), (b, 1))
+            p_cf_rows = np.tile(pc[changed].reshape(1, -1), (b, 1))
+
+        base_short = shortA.copy() if base_label == "A" else shortB.copy()
+        cf_short = base_short.copy()
+        # Thin each reinforced item's shortages independently, preserving monotonicity.
+        for k, j in enumerate(changed.tolist()):
+            base_item = base_short[:, j].astype(int)
+            ratio = np.divide(
+                p_cf_rows[:, k], np.maximum(p_base_rows[:, k], 1e-15),
+                out=np.zeros(b, dtype=float), where=p_base_rows[:, k] > 1e-15,
+            )
+            ratio = np.clip(ratio, 0.0, 1.0)
+            cf_short[:, j] = rng_cf.binomial(base_item, ratio)
+
+        diag = np.sum(counts * (t_diag * critical).reshape(1, -1), axis=1)
+        restore = np.sum(counts * (t_restore * critical).reshape(1, -1), axis=1)
+        wait_base = np.sum(((counts - base_short) * t_issue.reshape(1, -1) + base_short * baseline_wait.reshape(1, -1)) * critical.reshape(1, -1), axis=1)
+        wait_cf = np.sum(((counts - cf_short) * t_issue.reshape(1, -1) + cf_short * baseline_wait.reshape(1, -1)) * critical.reshape(1, -1), axis=1)
+        base_wait_out[start_i:end_i] = wait_base; cf_wait_out[start_i:end_i] = wait_cf
+        base_short_out[start_i:end_i] = base_short.sum(axis=1).astype(int); cf_short_out[start_i:end_i] = cf_short.sum(axis=1).astype(int)
+        base_ao[start_i:end_i] = np.clip(horizon_h / (horizon_h + diag + wait_base + restore), 0.0, 1.0)
+        cf_ao[start_i:end_i] = np.clip(horizon_h / (horizon_h + diag + wait_cf + restore), 0.0, 1.0)
+
+    proc_cost = np.asarray(ctx.get("proc_cost_c", np.zeros(m)), dtype=float).reshape(-1)
+    part_ids = np.asarray(ctx.get("part_id_c", np.arange(m)), dtype=object).reshape(-1)
+    cats = np.asarray(ctx.get("category_c", np.array([""] * m, dtype=object)), dtype=object).reshape(-1)
+    names = np.asarray(ctx.get("item_name_c", np.array([""] * m, dtype=object)), dtype=object).reshape(-1)
+
+    item_adjustments = []
+    for j in changed.tolist():
+        label = str(cats[j]).strip() or str(names[j]).strip() or str(part_ids[j])
+        u = int(merged[j])
+        item_adjustments.append({
+            "candidate_index": int(j), "item_label": label, "add_units": u,
+            "before_stock": int(base_stock[j]), "after_stock": int(cf_stock[j]),
+            "additional_cost": float(proc_cost[j] * u),
+        })
+    additional_cost = float(sum(x["additional_cost"] for x in item_adjustments))
+    total_units = int(sum(x["add_units"] for x in item_adjustments))
+    package_label = " + ".join(f"{x['item_label']} +{x['add_units']}" for x in item_adjustments)
+
+    def pct(a, q): return float(np.quantile(np.asarray(a, dtype=float), q))
+    # V27: explicit scenario-level RISK COVERAGE for the WHAT-IF replay.
+    # Coverage means the share of failure events that did not become spare-part shortages.
+    _den = np.maximum(total_failures.astype(float), 1.0)
+    base_risk_coverage = np.clip(1.0 - base_short_out.astype(float) / _den, 0.0, 1.0)
+    cf_risk_coverage = np.clip(1.0 - cf_short_out.astype(float) / _den, 0.0, 1.0)
+
+    before = {
+        "mean_Ao": float(np.mean(base_ao)), "p50_Ao": pct(base_ao, .50), "p10_Ao": pct(base_ao, .10), "p05_Ao": pct(base_ao, .05),
+        "mean_shortage_events": float(np.mean(base_short_out)), "mean_DT_wait_h": float(np.mean(base_wait_out)),
+        "shortage_free_rate": float(np.mean(base_short_out <= 0)),
+        "mean_risk_coverage": float(np.mean(base_risk_coverage)),
+    }
+    after = {
+        "mean_Ao": float(np.mean(cf_ao)), "p50_Ao": pct(cf_ao, .50), "p10_Ao": pct(cf_ao, .10), "p05_Ao": pct(cf_ao, .05),
+        "mean_shortage_events": float(np.mean(cf_short_out)), "mean_DT_wait_h": float(np.mean(cf_wait_out)),
+        "shortage_free_rate": float(np.mean(cf_short_out <= 0)),
+        "mean_risk_coverage": float(np.mean(cf_risk_coverage)),
+    }
+    scenario_df = pd.DataFrame({
+        "simulation_no": np.arange(1, iterations + 1, dtype=int),
+        "total_failures": total_failures, "Before_Ao": base_ao, "After_Ao": cf_ao,
+        "Before_shortage_events": base_short_out, "After_shortage_events": cf_short_out,
+        "Before_Risk_Coverage": base_risk_coverage, "After_Risk_Coverage": cf_risk_coverage,
+        "Before_DT_wait_h": base_wait_out, "After_DT_wait_h": cf_wait_out,
+    })
+    return {
+        "a_key": str(a_key), "b_key": str(b_key), "base_label": base_label,
+        "adjustments": item_adjustments, "item_count": len(item_adjustments), "total_add_units": total_units,
+        "item_label": package_label, "add_units": total_units,
+        "additional_cost": additional_cost,
+        "before": before, "after": after,
+        "delta": {
+            "mean_Ao_pp": float((after["mean_Ao"] - before["mean_Ao"]) * 100.0),
+            "p50_Ao_pp": float((after["p50_Ao"] - before["p50_Ao"]) * 100.0),
+            "p10_Ao_pp": float((after["p10_Ao"] - before["p10_Ao"]) * 100.0),
+            "p05_Ao_pp": float((after["p05_Ao"] - before["p05_Ao"]) * 100.0),
+            "mean_shortage_events": float(after["mean_shortage_events"] - before["mean_shortage_events"]),
+            "risk_coverage_pp": float((after["mean_risk_coverage"] - before["mean_risk_coverage"]) * 100.0),
+            "shortage_free_pp": float((after["shortage_free_rate"] - before["shortage_free_rate"]) * 100.0),
+            "mean_DT_wait_h": float(after["mean_DT_wait_h"] - before["mean_DT_wait_h"]),
+        },
+        "scenario_df": scenario_df, "common_future_scenarios": True,
+        "method": "replayed A/B stream + monotone shortage thinning for all reinforced items",
+    }
+
+
+def run_item_stock_whatif(
+    result: Dict[str, Any],
+    a_key: str,
+    b_key: str,
+    base_label: str,
+    candidate_index: int,
+    add_units: int = 1,
+    config: MonteCarloConfig | None = None,
+) -> Dict[str, Any]:
+    """Backward-compatible single-item wrapper around the multi-item engine."""
+    return run_multi_item_stock_whatif(
+        result, a_key, b_key, base_label,
+        [{"candidate_index": int(candidate_index), "add_units": int(add_units)}],
+        config,
+    )
+
+
+__all__ = [
+    "MonteCarloConfig",
+    "DEFAULT_MC_ITERATIONS",
+    "DEFAULT_MC_SEED",
+    "DEFAULT_STRESS_FACTOR",
+    "validate_monte_carlo_inputs",
+    "run_ab_monte_carlo",
+    "run_item_stock_whatif",
+    "run_multi_item_stock_whatif",
+]
